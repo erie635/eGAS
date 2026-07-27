@@ -1,0 +1,48 @@
+{
+  "project_info": {
+    "project_number": "352404895374",
+    "project_id": "efilling-d1456",
+    "storage_bucket": "efilling-d1456.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:352404895374:android:43cc8a3996749fa428fbdf",
+        "android_client_info": {
+          "package_name": "com.example.e_filling"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDDHiTpFsw03nwntmaiYwsX537HgLCwjBQ"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:352404895374:android:fbe3ad1f83b24c8928fbdf",
+        "android_client_info": {
+          "package_name": "com.example.e_gass"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDDHiTpFsw03nwntmaiYwsX537HgLCwjBQ"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

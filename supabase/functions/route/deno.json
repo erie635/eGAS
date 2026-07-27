@@ -1,0 +1,13 @@
+{
+  "imports": {}
+}
+drivers {
+  name: "John",
+  lat: -1.2921,
+  lng: 36.8219,
+  pricePerKm: 120,
+  numberPlate: "KCA 123A",
+  vehicleImage: "...",
+  driverImage: "...",
+  isOnline: true
+}

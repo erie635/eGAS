@@ -1,0 +1,4288 @@
+// ============================================================
+// FILE: lib/features/driver/driver_map_controller.dart
+// COMPLETE: ALL ORIGINAL LOGIC + ENHANCEMENTS + FIXES + ARRIVAL LISTENER
+// ============================================================
+
+import 'dart:async';
+import 'dart:convert';
+import 'dart:math';
+import 'dart:typed_data';
+import 'dart:ui' as ui;
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:google_maps_flutter/google_maps_flutter.dart';
+import 'package:geolocator/geolocator.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:http/http.dart' as http;
+import 'package:wakelock_plus/wakelock_plus.dart';
+import 'package:flutter_tts/flutter_tts.dart';
+import '../../services/discount_service.dart';
+
+// ============================================================
+// CONSTANTS
+// ============================================================
+const String googleAPIKey = 'AIzaSyATIUosv_VCeiVsQ3q6_LSQhZkrHr0E79o';
+const bool useCorsProxy = true;
+const String corsProxyUrl = 'https://cors-anywhere.herokuapp.com/';
+
+// ============================================================
+// NAVIGATION SESSION STATE
+// ============================================================
+enum NavigationSessionState {
+  idle,
+  navigating,
+  paused,
+  completed,
+  cancelled,
+}
+
+// ============================================================
+// LANE INFO
+// ============================================================
+class LaneInfo {
+  final bool left;
+  final bool straight;
+  final bool right;
+  final bool recommended;
+  final String label;
+
+  LaneInfo({
+    required this.left,
+    required this.straight,
+    required this.right,
+    this.recommended = false,
+    this.label = '',
+  });
+
+  String get displayChar {
+    if (left && right) return '⟷';
+    if (left) return '←';
+    if (right) return '→';
+    if (straight) return '↑';
+    return '•';
+  }
+
+  Color get color => recommended ? Colors.blue : Colors.grey;
+}
+
+// ============================================================
+// NAVIGATION STEP
+// ============================================================
+class NavigationStep {
+  final String instruction;
+  final String maneuver;
+  final double distance;
+  final String distanceText;
+  final Duration duration;
+  final String durationText;
+  final LatLng startLocation;
+  final LatLng endLocation;
+  final List<LatLng> points;
+  final String roadName;
+  final String roadShield;
+  final List<LaneInfo> lanes;
+  final double startHeading;
+  final double endHeading;
+
+  NavigationStep({
+    required this.instruction,
+    required this.maneuver,
+    required this.distance,
+    required this.distanceText,
+    required this.duration,
+    required this.durationText,
+    required this.startLocation,
+    required this.endLocation,
+    required this.points,
+    required this.roadName,
+    required this.roadShield,
+    required this.lanes,
+    required this.startHeading,
+    required this.endHeading,
+  });
+}
+
+// ============================================================
+// ANIMATED DRIVER DATA
+// ============================================================
+class AnimatedDriverData {
+  final String id;
+  final String vehicleType;
+  final String numberPlate;
+  final List<LatLng> path;
+  final double bearing;
+  final double speed;
+  final bool isMoving;
+
+  AnimatedDriverData({
+    required this.id,
+    required this.vehicleType,
+    required this.numberPlate,
+    required this.path,
+    required this.bearing,
+    required this.speed,
+    this.isMoving = true,
+  });
+}
+
+// ============================================================
+// ✅ ENHANCED: Error Log Entry
+// ============================================================
+class ErrorLogEntry {
+  final String message;
+  final Map<String, dynamic> details;
+  final DateTime timestamp;
+  final String level;
+
+  ErrorLogEntry({
+    required this.message,
+    this.details = const {},
+    required this.timestamp,
+    this.level = 'error',
+  });
+
+  Map<String, dynamic> toJson() => {
+    'message': message,
+    'details': details,
+    'timestamp': timestamp.toIso8601String(),
+    'level': level,
+  };
+}
+
+// ============================================================
+// ✅ ENHANCED: DRIVER MAP CONTROLLER
+// ============================================================
+class DriverMapController {
+  // ============================================================
+  // MAP CONTROLLER & STATE
+  // ============================================================
+  GoogleMapController? mapController;
+  Set<Marker> mapMarkers = {};
+  Set<Marker> animatedMarkers = {};
+  Set<Polyline> polylines = {};
+  LatLng? driverLocation;
+  LatLng? customerLocation;
+  double? distanceToCustomer;
+  int? estimatedMinutes;
+  BuildContext? _context;
+
+  // ============================================================
+  // FIREBASE
+  // ============================================================
+  FirebaseFirestore firestore = FirebaseFirestore.instance;
+  DocumentReference? driverLocationRef;
+  DocumentReference? sessionRef;
+  String? driverId;
+
+  // ============================================================
+  // NAVIGATION SESSION MANAGEMENT
+  // ============================================================
+  String? _currentSessionId;
+  NavigationSessionState _currentSessionState = NavigationSessionState.idle;
+  bool _isSessionActive = false;
+  bool _navigationInitialized = false;
+  bool _hasAnnouncedStartingNavigation = false;
+  bool _hasArrivedAndSessionEnded = false;
+  bool _isInitializingNavigation = false;
+  StreamSubscription<DocumentSnapshot>? _sessionSubscription;
+  Map<String, dynamic> _sessionData = {};
+  Timer? _sessionUpdateTimer;
+
+  // ============================================================
+  // SESSION CALLBACKS
+  // ============================================================
+  VoidCallback? onSessionStarted;
+  VoidCallback? onSessionCompleted;
+  VoidCallback? onSessionCancelled;
+  Function(String)? onSessionError;
+  Function(Map<String, dynamic>)? onSessionUpdate;
+
+  // ============================================================
+  // THROTTLING & DEBOUNCING
+  // ============================================================
+  LatLng? lastSentPosition;
+  double minDistanceThreshold = 15.0;
+  Duration minTimeThreshold = const Duration(seconds: 5);
+  DateTime? lastFirestoreUpdateTime;
+  Timer? firestoreDebounceTimer;
+  bool isFirestoreUpdateQueued = false;
+  LatLng? queuedPosition;
+  double? queuedHeading;
+  double? queuedSpeed;
+
+  // ============================================================
+  // NAVIGATION ENHANCEMENTS
+  // ============================================================
+  List<LatLng> currentRoutePoints = [];
+  Timer? routeRecalculationTimer;
+  bool isRecalculatingRoute = false;
+  static const double routeRecalculationThreshold = 50.0;
+  LatLng? lastRouteOrigin;
+  LatLng? lastRouteDestination;
+  Duration? actualTravelDuration;
+  String? travelDurationText;
+  bool useActualEta = false;
+
+  // ============================================================
+  // SMOOTH INTERPOLATION
+  // ============================================================
+  LatLng? interpolatedDriverPosition;
+  Timer? interpolationTimer;
+  double interpolationProgress = 1.0;
+  LatLng? previousInterpolatedPosition;
+  LatLng? targetInterpolatedPosition;
+  DateTime? interpolationStartTime;
+  static const Duration interpolationDuration = Duration(milliseconds: 400);
+
+  // ============================================================
+  // ENHANCED TURN-BY-TURN NAVIGATION
+  // ============================================================
+  List<NavigationStep> routeSteps = [];
+  int currentStepIndex = 0;
+  bool isNavigating = false;
+  String nextInstruction = '';
+  String nextManeuver = '';
+  double nextStepDistance = 0;
+  Timer? turnAlertTimer;
+  bool hasAnnouncedCurrentStep = false;
+
+  // ============================================================
+  // HEADING-BASED TURN VALIDATION
+  // ============================================================
+  double? lastValidHeading;
+  List<double> headingHistory = [];
+  static const int maxHeadingHistory = 5;
+  double? currentRoadHeading;
+  double? nextRoadHeading;
+  double turnAngle = 0;
+
+  // ============================================================
+  // ZOOM CONTROL
+  // ============================================================
+  double currentZoom = 17.0;
+  static const double baseZoom = 17.0;
+  Timer? zoomSmoothingTimer;
+  static const double driverOffsetY = 0.7;
+
+  // ============================================================
+  // PREDICTIVE CAMERA
+  // ============================================================
+  bool predictiveCameraEnabled = true;
+  LatLng? predictedCameraTarget;
+  bool isMapRotating = true;
+
+  // ============================================================
+  // DRIVER SPEED & HEADING
+  // ============================================================
+  double currentSpeed = 0.0;
+  double currentHeading = 0.0;
+  double previousHeading = 0.0;
+  double headingSmooth = 0.0;
+  Timer? headingSmoothingTimer;
+
+  // ============================================================
+  // CAMERA FOLLOWING
+  // ============================================================
+  Timer? cameraFollowTimer;
+  bool isCameraFollowing = true;
+  LatLng? cameraTargetPosition;
+  double cameraBearing = 0;
+  double cameraZoom = 17.0;
+  LatLng? lastKnownPosition;
+  bool isDriverMoving = false;
+  Timer? movementCheckTimer;
+  static const double movementThreshold = 0.5;
+
+  // ============================================================
+  // MARKER CACHE
+  // ============================================================
+  final Map<String, BitmapDescriptor> markerCache = {};
+
+  // ============================================================
+  // CALLBACKS
+  // ============================================================
+  VoidCallback? onMapUpdated;
+  Function(String, String)? onTurnAlert;
+
+  // ============================================================
+  // TRAFFIC FEATURES
+  // ============================================================
+  bool trafficEnabled = true;
+  bool isCheckingTraffic = false;
+  Timer? trafficUpdateTimer;
+  Color currentTrafficColor = const Color(0xFF1A73E8);
+  Map<String, dynamic>? currentTrafficData;
+  List<Map<String, dynamic>> trafficSegments = [];
+
+  // ============================================================
+  // SPEED LIMIT FEATURES
+  // ============================================================
+  int currentSpeedLimit = 0;
+  bool isSpeeding = false;
+  Timer? speedLimitTimer;
+  String speedLimitDisplay = '--';
+
+  // ============================================================
+  // ALTERNATIVE ROUTES
+  // ============================================================
+  List<List<LatLng>> alternativeRoutes = [];
+  List<Duration> alternativeDurations = [];
+  int selectedRouteIndex = 0;
+
+  // ============================================================
+  // VOICE NAVIGATION
+  // ============================================================
+  bool isVoiceEnabled = true;
+  String lastSpokenInstruction = '';
+  Timer? voiceDebounceTimer;
+  Timer? voiceAnnouncementTimer;
+  double lastAnnouncementDistance = -1;
+  List<String> announcementQueue = [];
+  Function(String)? speakCallback;
+  FlutterTts? _tts;
+  bool _ttsInitialized = false;
+
+  // ============================================================
+  // WAKE LOCK
+  // ============================================================
+  bool _wakeLockEnabled = false;
+
+  // ============================================================
+  // ROAD SNAPPING
+  // ============================================================
+  LatLng? snappedDriverPosition;
+  Timer? snappingTimer;
+  List<LatLng> recentPositions = [];
+  static const int maxRecentPositions = 10;
+
+  // ============================================================
+  // LANE GUIDANCE
+  // ============================================================
+  List<LaneInfo> laneGuidance = [];
+  String laneGuidanceText = '';
+
+  // ============================================================
+  // JUNCTION VIEW
+  // ============================================================
+  bool isNearJunction = false;
+  bool showJunctionOverlay = false;
+  String junctionRoadName = '';
+  String junctionManeuver = '';
+  double junctionDistance = 0;
+
+  // ============================================================
+  // ROAD SHIELDS
+  // ============================================================
+  Map<String, String> roadShields = {};
+
+  // ============================================================
+  // ENHANCED NAVIGATION BANNER
+  // ============================================================
+  bool showNavigationBanner = false;
+  String bannerInstruction = '';
+  String bannerManeuver = '';
+  String bannerDistance = '';
+  String bannerNextRoad = '';
+  String bannerCurrentRoad = '';
+  double bannerProgress = 0.0;
+  String bannerSubInstruction = '';
+
+  // ============================================================
+  // ARRIVAL ANIMATION
+  // ============================================================
+  bool hasArrived = false;
+  Timer? arrivalAnimationTimer;
+
+  // ============================================================
+  // ✅ ADDED: Arrival listener timer to stop route refreshing
+  // ============================================================
+  Timer? _arrivalCheckTimer;
+
+  // ============================================================
+  // TRAFFIC COLOR MAP
+  // ============================================================
+  Map<String, Color> trafficColorMap = {
+    'LIGHT': Colors.green,
+    'MODERATE': Colors.orange,
+    'HEAVY': Colors.red,
+    'SEVERE': Colors.red.shade900,
+  };
+
+  // ============================================================
+  // GPS FILTERING
+  // ============================================================
+  LatLng? filteredPosition;
+  double filterAlpha = 0.7;
+
+  // ============================================================
+  // MAP PADDING
+  // ============================================================
+  EdgeInsets mapPadding = const EdgeInsets.only(
+    top: 40,
+    bottom: 180,
+    left: 10,
+    right: 10,
+  );
+  double screenHeight = 0;
+  double screenWidth = 0;
+
+  // ============================================================
+  // ROUTE FOLLOWING
+  // ============================================================
+  bool useRouteFollowing = true;
+  double routeSnapDistance = 30.0;
+
+  // ============================================================
+  // VEHICLE INFO
+  // ============================================================
+  double carWidth = 80.0;
+  double carHeight = 120.0;
+  String? _currentVehicleType;
+  String? _currentNumberPlate;
+
+  // ============================================================
+  // UI OVERFLOW FIX
+  // ============================================================
+  bool useScrollableContent = true;
+
+  // ============================================================
+  // ANIMATED MARKER TRACKING
+  // ============================================================
+  final Map<String, AnimatedDriverData> _animatedDrivers = {};
+  final Map<String, List<LatLng>> _driverPaths = {};
+  final Map<String, Marker> _staticDrivers = {};
+  Timer? _animationUpdateTimer;
+  Duration animarkerDuration = const Duration(milliseconds: 2000);
+  Curve animarkerCurve = Curves.easeInOut;
+  bool animarkerUseRotation = true;
+
+  // ============================================================
+  // ✅ ENHANCED: Configuration options for feature toggles
+  // ============================================================
+  Map<String, bool> _features = {
+    'voiceNavigation': true,
+    'routeSnapping': true,
+    'wakeLock': true,
+    'trafficMonitoring': true,
+    'speedLimitMonitoring': true,
+    'progressiveRouteClearing': true,
+    'predictiveCamera': true,
+    'junctionOverlay': true,
+    'animatedMarkers': true,
+    'alternativeRoutes': true,
+  };
+
+  // ============================================================
+  // ✅ ENHANCED: Error logging system
+  // ============================================================
+  final List<ErrorLogEntry> _errorLogs = [];
+  static const int maxErrorLogs = 100;
+  Function(ErrorLogEntry)? onErrorLogged;
+
+  // ============================================================
+  // ✅ ENHANCED: Performance tracking
+  // ============================================================
+  Map<String, Stopwatch> _performanceTimers = {};
+  Map<String, Duration> _performanceMetrics = {};
+
+  // ============================================================
+  // ✅ ENHANCED: Retry configuration
+  // ============================================================
+  static const int _maxRetries = 3;
+  static const Duration _retryDelay = Duration(seconds: 2);
+
+  // ============================================================
+  // CONSTRUCTOR
+  // ============================================================
+  DriverMapController({
+    BuildContext? context,
+    this.driverId,
+  }) {
+    _context = context;
+    if (driverId != null) {
+      driverLocationRef = firestore.collection('drivers').doc(driverId);
+      _autoCreateDriverController();
+    }
+    _initTTS();
+    _startPerformanceMonitoring();
+  }
+
+  void setContext(BuildContext context) {
+    _context = context;
+  }
+
+  // ============================================================
+  // ✅ ENHANCED: Feature toggles (dynamic configuration)
+  // ============================================================
+  void setFeature(String feature, bool enabled) {
+    if (_features.containsKey(feature)) {
+      _features[feature] = enabled;
+      _logInfo('Feature "$feature" set to $enabled', details: {'feature': feature, 'enabled': enabled});
+      
+      switch (feature) {
+        case 'voiceNavigation':
+          isVoiceEnabled = enabled;
+          if (!enabled) {
+            _tts?.stop();
+          }
+          break;
+        case 'routeSnapping':
+          useRouteFollowing = enabled;
+          break;
+        case 'wakeLock':
+          if (enabled) {
+            enableWakeLock();
+          } else {
+            disableWakeLock();
+          }
+          break;
+        case 'trafficMonitoring':
+          if (enabled) {
+            startTrafficMonitoring();
+          } else {
+            trafficUpdateTimer?.cancel();
+            trafficUpdateTimer = null;
+          }
+          break;
+        case 'speedLimitMonitoring':
+          if (enabled) {
+            startSpeedLimitMonitoring();
+          } else {
+            speedLimitTimer?.cancel();
+            speedLimitTimer = null;
+          }
+          break;
+        case 'progressiveRouteClearing':
+          break;
+        case 'predictiveCamera':
+          predictiveCameraEnabled = enabled;
+          break;
+        case 'junctionOverlay':
+          break;
+        case 'animatedMarkers':
+          if (!enabled) {
+            _animationUpdateTimer?.cancel();
+            _animationUpdateTimer = null;
+          } else {
+            initializeAnimationUpdates();
+          }
+          break;
+        case 'alternativeRoutes':
+          break;
+        default:
+          break;
+      }
+    }
+  }
+
+  bool getFeature(String feature) {
+    return _features[feature] ?? false;
+  }
+
+  Map<String, bool> getAllFeatures() {
+    return Map<String, bool>.from(_features);
+  }
+
+  // ============================================================
+  // ✅ ENHANCED: Error logging methods
+  // ============================================================
+  void _logError(String message, {Map<String, dynamic>? details}) {
+    final entry = ErrorLogEntry(
+      message: message,
+      details: details ?? {},
+      timestamp: DateTime.now(),
+      level: 'error',
+    );
+    _errorLogs.add(entry);
+    if (_errorLogs.length > maxErrorLogs) {
+      _errorLogs.removeAt(0);
+    }
+    onErrorLogged?.call(entry);
+    print('❌ ERROR: $message');
+    if (details != null) {
+      print('   Details: $details');
+    }
+  }
+
+  void _logWarning(String message, {Map<String, dynamic>? details}) {
+    final entry = ErrorLogEntry(
+      message: message,
+      details: details ?? {},
+      timestamp: DateTime.now(),
+      level: 'warning',
+    );
+    _errorLogs.add(entry);
+    if (_errorLogs.length > maxErrorLogs) {
+      _errorLogs.removeAt(0);
+    }
+    print('⚠️ WARNING: $message');
+  }
+
+  void _logInfo(String message, {Map<String, dynamic>? details}) {
+    if (details != null) {
+      print('ℹ️ INFO: $message $details');
+    } else {
+      print('ℹ️ INFO: $message');
+    }
+  }
+
+  List<ErrorLogEntry> getErrorLogs() {
+    return List<ErrorLogEntry>.from(_errorLogs);
+  }
+
+  void clearErrorLogs() {
+    _errorLogs.clear();
+  }
+
+  // ============================================================
+  // ✅ ENHANCED: Performance monitoring
+  // ============================================================
+  void _startPerformanceMonitoring() {
+    _performanceTimers['routeRecalculation'] = Stopwatch();
+    _performanceTimers['arrivalDetection'] = Stopwatch();
+    _performanceTimers['routeParsing'] = Stopwatch();
+    _performanceTimers['markerGeneration'] = Stopwatch();
+    _performanceTimers['routeDrawing'] = Stopwatch();
+  }
+
+  void _startTimer(String name) {
+    if (_performanceTimers.containsKey(name)) {
+      _performanceTimers[name]!.reset();
+      _performanceTimers[name]!.start();
+    }
+  }
+
+  void _stopTimer(String name) {
+    if (_performanceTimers.containsKey(name)) {
+      _performanceTimers[name]!.stop();
+      _performanceMetrics[name] = _performanceTimers[name]!.elapsed;
+      if (_performanceMetrics[name]!.inMilliseconds > 100) {
+        _logWarning('Performance: $name took ${_performanceMetrics[name]!.inMilliseconds}ms', 
+            details: {'duration': _performanceMetrics[name]!.inMilliseconds});
+      }
+    }
+  }
+
+  Map<String, Duration> getPerformanceMetrics() {
+    return Map<String, Duration>.from(_performanceMetrics);
+  }
+
+  // ============================================================
+  // ✅ ENHANCED: Retry logic for Firebase operations
+  // ============================================================
+  Future<T> _withRetry<T>(Future<T> Function() operation, {String operationName = 'Firebase operation'}) async {
+    int attempts = 0;
+    while (attempts < _maxRetries) {
+      try {
+        return await operation();
+      } catch (e) {
+        attempts++;
+        if (attempts >= _maxRetries) {
+          _logError('$operationName failed after $_maxRetries attempts', details: {'error': e.toString()});
+          rethrow;
+        }
+        _logWarning('$operationName attempt $attempts failed, retrying in ${_retryDelay.inSeconds}s...');
+        await Future.delayed(_retryDelay);
+      }
+    }
+    throw Exception('$operationName failed');
+  }
+
+  // ============================================================
+  // AUTO-CREATE DRIVER CONTROLLER IN FIREBASE
+  // ============================================================
+  Future<void> _autoCreateDriverController() async {
+    if (driverId == null) return;
+    try {
+      final doc = await firestore.collection('drivers').doc(driverId!).get();
+      if (!doc.exists) {
+        _logInfo('Auto-creating driver controller in Firebase...');
+        await firestore.collection('drivers').doc(driverId!).set({
+          'uid': driverId,
+          'email': null,
+          'name': 'Driver',
+          'vehicleType': 'small',
+          'numberPlate': 'Unknown',
+          'isOnline': false,
+          'isAvailable': true,
+          'createdAt': FieldValue.serverTimestamp(),
+          'updatedAt': FieldValue.serverTimestamp(),
+          'position': {'lat': 0.0, 'lng': 0.0},
+          'heading': 0.0,
+          'speed': 0.0,
+          'rating': 0.0,
+          'totalDeliveries': 0,
+          'status': 'offline',
+          'sessionId': null,
+          'sessionState': 'idle',
+          'currentOrderId': null,
+          'currentCustomerId': null,
+          'navigationActive': false,
+          'hasArrived': false,
+        });
+        _logInfo('Driver controller auto-created in Firebase!');
+      }
+    } catch (e) {
+      _logError('Error auto-creating driver controller', details: {'error': e.toString()});
+    }
+  }
+
+  // ============================================================
+  // CREATE DRIVER CONTROLLER WITH CUSTOM DATA
+  // ============================================================
+  Future<void> createDriverController({
+    required String email,
+    required String name,
+    String vehicleType = 'small',
+    String numberPlate = 'Unknown',
+  }) async {
+    if (driverId == null) return;
+    try {
+      await firestore.collection('drivers').doc(driverId!).set({
+        'uid': driverId,
+        'email': email,
+        'name': name,
+        'vehicleType': vehicleType,
+        'numberPlate': numberPlate,
+        'isOnline': false,
+        'isAvailable': true,
+        'createdAt': FieldValue.serverTimestamp(),
+        'updatedAt': FieldValue.serverTimestamp(),
+        'position': {'lat': 0.0, 'lng': 0.0},
+        'heading': 0.0,
+        'speed': 0.0,
+        'rating': 0.0,
+        'totalDeliveries': 0,
+        'status': 'offline',
+        'sessionId': null,
+        'sessionState': 'idle',
+        'currentOrderId': null,
+        'currentCustomerId': null,
+        'navigationActive': false,
+        'hasArrived': false,
+      }, SetOptions(merge: true));
+      _logInfo('Driver controller created with custom data!');
+    } catch (e) {
+      _logError('Error creating driver controller', details: {'error': e.toString()});
+      throw Exception('Failed to create driver controller: $e');
+    }
+  }
+
+  // ============================================================
+  // UPDATE DRIVER INFORMATION
+  // ============================================================
+  Future<void> updateDriverInfo({
+    String? name,
+    String? vehicleType,
+    String? numberPlate,
+    bool? isOnline,
+    bool? isAvailable,
+  }) async {
+    if (driverId == null) return;
+    try {
+      final updates = <String, dynamic>{
+        'updatedAt': FieldValue.serverTimestamp(),
+      };
+      if (name != null) updates['name'] = name;
+      if (vehicleType != null) updates['vehicleType'] = vehicleType;
+      if (numberPlate != null) updates['numberPlate'] = numberPlate;
+      if (isOnline != null) {
+        updates['isOnline'] = isOnline;
+        updates['status'] = isOnline ? 'online' : 'offline';
+      }
+      if (isAvailable != null) updates['isAvailable'] = isAvailable;
+      await firestore.collection('drivers').doc(driverId!).update(updates);
+      _logInfo('Driver info updated');
+    } catch (e) {
+      _logError('Error updating driver info', details: {'error': e.toString()});
+      throw Exception('Failed to update driver info: $e');
+    }
+  }
+
+  // ============================================================
+  // SET DRIVER ONLINE/OFFLINE
+  // ============================================================
+  Future<void> setDriverOnline(bool online) async {
+    await updateDriverInfo(isOnline: online);
+    if (online && getFeature('wakeLock')) {
+      await enableWakeLock();
+    } else {
+      await disableWakeLock();
+    }
+  }
+
+  // ============================================================
+  // GET DRIVER DATA FROM FIREBASE
+  // ============================================================
+  Future<Map<String, dynamic>?> getDriverData() async {
+    if (driverId == null) return null;
+    try {
+      final doc = await firestore.collection('drivers').doc(driverId!).get();
+      if (doc.exists) return doc.data();
+      return null;
+    } catch (e) {
+      _logError('Error getting driver data', details: {'error': e.toString()});
+      return null;
+    }
+  }
+
+  // ============================================================
+  // CHECK IF DRIVER CONTROLLER EXISTS
+  // ============================================================
+  Future<bool> driverControllerExists() async {
+    if (driverId == null) return false;
+    try {
+      final doc = await firestore.collection('drivers').doc(driverId!).get();
+      return doc.exists;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // ============================================================
+  // TTS INITIALIZATION
+  // ============================================================
+  void _initTTS() {
+    if (_ttsInitialized) return;
+    try {
+      _tts = FlutterTts();
+      _tts?.setLanguage('en-US');
+      _tts?.setSpeechRate(0.5);
+      _tts?.setPitch(1.0);
+      _tts?.setVolume(1.0);
+      _ttsInitialized = true;
+      _logInfo('TTS initialized successfully');
+    } catch (e) {
+      _logWarning('TTS initialization error', details: {'error': e.toString()});
+    }
+  }
+
+  // ============================================================
+  // SPEAK METHOD
+  // ============================================================
+  void speak(String text) {
+    if (!isVoiceEnabled || !getFeature('voiceNavigation')) return;
+    if (text == lastSpokenInstruction) return;
+    if (voiceAnnouncementTimer != null && voiceAnnouncementTimer!.isActive) {
+      announcementQueue.add(text);
+      return;
+    }
+    _speakImmediately(text);
+  }
+
+  void _speakImmediately(String text) {
+    voiceDebounceTimer?.cancel();
+    voiceDebounceTimer = Timer(const Duration(milliseconds: 300), () {
+      lastSpokenInstruction = text;
+      if (_ttsInitialized && _tts != null) {
+        _tts?.speak(text);
+      }
+      if (speakCallback != null) {
+        speakCallback!(text);
+      }
+      _logInfo('VOICE: $text');
+    });
+    voiceAnnouncementTimer?.cancel();
+    voiceAnnouncementTimer = Timer(const Duration(seconds: 2), () {
+      if (announcementQueue.isNotEmpty) {
+        final nextText = announcementQueue.removeAt(0);
+        _speakImmediately(nextText);
+      }
+    });
+  }
+
+  void setSpeakCallback(Function(String) callback) {
+    speakCallback = callback;
+  }
+
+  // ============================================================
+  // WAKE LOCK
+  // ============================================================
+  Future<void> enableWakeLock() async {
+    if (_wakeLockEnabled) return;
+    try {
+      await WakelockPlus.enable();
+      _wakeLockEnabled = true;
+      _logInfo('Screen wake lock enabled');
+    } catch (e) {
+      _logWarning('Wake lock enable error', details: {'error': e.toString()});
+    }
+  }
+
+  Future<void> disableWakeLock() async {
+    if (!_wakeLockEnabled) return;
+    try {
+      await WakelockPlus.disable();
+      _wakeLockEnabled = false;
+      _logInfo('Screen wake lock disabled');
+    } catch (e) {
+      _logWarning('Wake lock disable error', details: {'error': e.toString()});
+    }
+  }
+
+  Future<void> toggleWakeLock(bool enable) async {
+    if (enable) {
+      await enableWakeLock();
+    } else {
+      await disableWakeLock();
+    }
+  }
+
+  bool isWakeLockEnabled() {
+    return _wakeLockEnabled;
+  }
+
+  // ============================================================
+  // FIREBASE SESSION MANAGEMENT - REAL-TIME CONTROL
+  // ============================================================
+
+  Future<String> createNavigationSession({
+    required String orderId,
+    required String customerId,
+    required String customerName,
+    required LatLng origin,
+    required LatLng destination,
+    required String vehicleType,
+    required String numberPlate,
+  }) async {
+    if (driverId == null) {
+      throw Exception('Driver ID not set');
+    }
+
+    if (_isSessionActive) {
+      await endNavigationSession(cancelled: true);
+    }
+
+    _navigationInitialized = false;
+    _hasAnnouncedStartingNavigation = false;
+    _hasArrivedAndSessionEnded = false;
+    hasArrived = false;
+    _isInitializingNavigation = false;
+
+    _currentSessionId = firestore
+        .collection('drivers')
+        .doc(driverId)
+        .collection('navigation_sessions')
+        .doc()
+        .id;
+
+    _sessionData = {
+      'sessionId': _currentSessionId,
+      'driverId': driverId,
+      'orderId': orderId,
+      'customerId': customerId,
+      'customerName': customerName,
+      'vehicleType': vehicleType,
+      'numberPlate': numberPlate,
+      'origin': {
+        'lat': origin.latitude,
+        'lng': origin.longitude,
+      },
+      'destination': {
+        'lat': destination.latitude,
+        'lng': destination.longitude,
+      },
+      'state': 'idle',
+      'createdAt': FieldValue.serverTimestamp(),
+      'startedAt': null,
+      'completedAt': null,
+      'cancelledAt': null,
+      'totalDistance': 0.0,
+      'totalDuration': 0,
+      'currentStepIndex': 0,
+      'currentInstruction': '',
+      'isRecalculating': false,
+      'progress': 0.0,
+      'isActive': true,
+      'updatedAt': FieldValue.serverTimestamp(),
+    };
+
+    sessionRef = firestore
+        .collection('drivers')
+        .doc(driverId)
+        .collection('navigation_sessions')
+        .doc(_currentSessionId);
+
+    await sessionRef!.set(_sessionData);
+
+    await firestore
+        .collection('orders')
+        .doc(orderId)
+        .update({
+      'navigationSessionId': _currentSessionId,
+      'navigationStatus': 'started',
+      'updatedAt': FieldValue.serverTimestamp(),
+    });
+
+    await firestore
+        .collection('drivers')
+        .doc(driverId)
+        .update({
+      'sessionId': _currentSessionId,
+      'sessionState': 'idle',
+      'currentOrderId': orderId,
+      'currentCustomerId': customerId,
+      'navigationActive': true,
+      'hasArrived': false,
+      'updatedAt': FieldValue.serverTimestamp(),
+    });
+
+    _isSessionActive = true;
+    _currentSessionState = NavigationSessionState.idle;
+
+    _startSessionListener();
+    _startSessionUpdateTimer();
+
+    _logInfo('Navigation session created: $_currentSessionId');
+    return _currentSessionId!;
+  }
+
+  void _startSessionListener() {
+    _sessionSubscription?.cancel();
+    if (sessionRef == null) return;
+
+    _sessionSubscription = sessionRef!.snapshots().listen(
+      (snapshot) {
+        if (!snapshot.exists) {
+          _logWarning('Session document deleted');
+          _handleSessionEnded();
+          return;
+        }
+
+        final data = snapshot.data() as Map<String, dynamic>;
+        _sessionData = data;
+
+        final stateString = data['state'] as String? ?? 'idle';
+        final newState = NavigationSessionState.values.firstWhere(
+          (e) => e.toString().split('.').last == stateString,
+          orElse: () => NavigationSessionState.idle,
+        );
+
+        if (newState != _currentSessionState) {
+          _logInfo('Session state changed: ${_currentSessionState} → $newState');
+          _currentSessionState = newState;
+          _handleSessionStateChange(newState, data);
+        }
+
+        onSessionUpdate?.call(data);
+        _logInfo('Session updated from Firebase: ${data['state']}');
+      },
+      onError: (error) {
+        _logError('Session listener error', details: {'error': error.toString()});
+        onSessionError?.call(error.toString());
+      },
+    );
+  }
+
+  void _handleSessionStateChange(NavigationSessionState state, Map<String, dynamic> data) {
+    _logInfo('Handling session state change: $state');
+    
+    switch (state) {
+      case NavigationSessionState.idle:
+        if (_navigationInitialized && !_hasArrivedAndSessionEnded) {
+          _navigationInitialized = false;
+          _hasAnnouncedStartingNavigation = false;
+          _logInfo('Navigation reset to idle state');
+        }
+        break;
+
+      case NavigationSessionState.navigating:
+        if (!_navigationInitialized && currentRoutePoints.isNotEmpty) {
+          _initializeNavigation();
+        }
+        if (!isNavigating && _navigationInitialized) {
+          isNavigating = true;
+          _startTurnAlerts();
+          speak('Resuming navigation');
+        }
+        break;
+
+      case NavigationSessionState.paused:
+        if (isNavigating) {
+          isNavigating = false;
+          turnAlertTimer?.cancel();
+          speak('Navigation paused');
+          _logInfo('Navigation paused from Firebase');
+        }
+        break;
+
+      case NavigationSessionState.completed:
+        if (!_hasArrivedAndSessionEnded) {
+          _completeNavigationFromFirebase();
+        }
+        break;
+
+      case NavigationSessionState.cancelled:
+        if (!_hasArrivedAndSessionEnded) {
+          _cancelNavigationFromFirebase();
+        }
+        break;
+    }
+  }
+
+  Future<void> updateSessionState(NavigationSessionState state) async {
+    if (sessionRef == null || !_isSessionActive) {
+      _logWarning('Cannot update session: not active');
+      return;
+    }
+
+    final stateString = state.toString().split('.').last;
+    Map<String, dynamic> updates = {
+      'state': stateString,
+      'updatedAt': FieldValue.serverTimestamp(),
+    };
+
+    switch (state) {
+      case NavigationSessionState.navigating:
+        updates['startedAt'] = FieldValue.serverTimestamp();
+        updates['isActive'] = true;
+        break;
+      case NavigationSessionState.completed:
+        updates['completedAt'] = FieldValue.serverTimestamp();
+        updates['isActive'] = false;
+        break;
+      case NavigationSessionState.cancelled:
+        updates['cancelledAt'] = FieldValue.serverTimestamp();
+        updates['isActive'] = false;
+        break;
+      default:
+        break;
+    }
+
+    await sessionRef!.update(updates);
+    _currentSessionState = state;
+    
+    if (driverId != null) {
+      await firestore
+          .collection('drivers')
+          .doc(driverId!)
+          .update({
+        'sessionState': stateString,
+        'updatedAt': FieldValue.serverTimestamp(),
+      });
+    }
+    
+    _logInfo('Session state updated to: $stateString');
+  }
+
+  Future<void> updateSessionProgress() async {
+    if (sessionRef == null || !_isSessionActive) return;
+
+    double progress = 0.0;
+    if (routeSteps.isNotEmpty) {
+      progress = currentStepIndex / routeSteps.length;
+    }
+
+    double totalDistance = 0.0;
+    if (currentRoutePoints.isNotEmpty) {
+      for (int i = 0; i < currentStepIndex && i < routeSteps.length; i++) {
+        totalDistance += routeSteps[i].distance;
+      }
+      if (currentStepIndex < routeSteps.length && driverLocation != null) {
+        final currentStep = routeSteps[currentStepIndex];
+        final distanceToEnd = Geolocator.distanceBetween(
+          driverLocation!.latitude,
+          driverLocation!.longitude,
+          currentStep.endLocation.latitude,
+          currentStep.endLocation.longitude,
+        );
+        final stepProgress = 1 - (distanceToEnd / currentStep.distance);
+        totalDistance += currentStep.distance * stepProgress.clamp(0.0, 1.0);
+      }
+    }
+
+    int totalDuration = 0;
+    if (_sessionData['startedAt'] != null) {
+      final startedAt = (_sessionData['startedAt'] as Timestamp).toDate();
+      totalDuration = DateTime.now().difference(startedAt).inSeconds;
+    }
+
+    await sessionRef!.update({
+      'totalDistance': totalDistance / 1000,
+      'totalDuration': totalDuration,
+      'currentStepIndex': currentStepIndex,
+      'currentInstruction': nextInstruction,
+      'isRecalculating': isRecalculatingRoute,
+      'progress': progress,
+      'updatedAt': FieldValue.serverTimestamp(),
+      'lastLocation': {
+        'lat': driverLocation?.latitude ?? 0,
+        'lng': driverLocation?.longitude ?? 0,
+      },
+      'currentSpeed': currentSpeed,
+      'currentHeading': currentHeading,
+    });
+  }
+
+  void _startSessionUpdateTimer() {
+    _sessionUpdateTimer?.cancel();
+    _sessionUpdateTimer = Timer.periodic(
+      const Duration(seconds: 10),
+      (timer) {
+        if (_isSessionActive) {
+          updateSessionProgress();
+        }
+      },
+    );
+  }
+
+  Future<void> endNavigationSession({bool cancelled = false}) async {
+    if (!_isSessionActive || sessionRef == null) return;
+
+    final state = cancelled
+        ? NavigationSessionState.cancelled
+        : NavigationSessionState.completed;
+
+    await updateSessionState(state);
+
+    _isSessionActive = false;
+    _navigationInitialized = false;
+    _hasAnnouncedStartingNavigation = false;
+    _hasArrivedAndSessionEnded = true;
+    _isInitializingNavigation = false;
+    _sessionSubscription?.cancel();
+    _sessionSubscription = null;
+    _sessionUpdateTimer?.cancel();
+    _sessionUpdateTimer = null;
+
+    if (driverId != null) {
+      await firestore
+          .collection('drivers')
+          .doc(driverId!)
+          .update({
+        'sessionId': null,
+        'sessionState': 'idle',
+        'currentOrderId': null,
+        'currentCustomerId': null,
+        'navigationActive': false,
+        'hasArrived': cancelled ? false : true,
+        'updatedAt': FieldValue.serverTimestamp(),
+      });
+    }
+
+    if (_sessionData.containsKey('orderId')) {
+      await firestore
+          .collection('orders')
+          .doc(_sessionData['orderId'])
+          .update({
+        'navigationStatus': cancelled ? 'cancelled' : 'completed',
+        'navigationSessionId': _currentSessionId,
+        'updatedAt': FieldValue.serverTimestamp(),
+      });
+    }
+
+    if (cancelled) {
+      onSessionCancelled?.call();
+    } else {
+      onSessionCompleted?.call();
+    }
+
+    _logInfo('Session ended: ${cancelled ? 'cancelled' : 'completed'}');
+  }
+
+  void _handleSessionEnded() {
+    _isSessionActive = false;
+    _navigationInitialized = false;
+    _hasAnnouncedStartingNavigation = false;
+    _hasArrivedAndSessionEnded = true;
+    _isInitializingNavigation = false;
+    _sessionUpdateTimer?.cancel();
+    _sessionUpdateTimer = null;
+    clearRoute();
+    onSessionCompleted?.call();
+    _logInfo('Session ended from Firebase');
+  }
+
+  void _initializeNavigation() {
+    if (_isInitializingNavigation) {
+      _logWarning('Navigation initialization already in progress, skipping...');
+      return;
+    }
+    
+    if (_navigationInitialized) {
+      _logWarning('Navigation already initialized, skipping...');
+      return;
+    }
+    
+    if (routeSteps.isEmpty) {
+      _logWarning('No route steps available, cannot initialize navigation');
+      return;
+    }
+    
+    _isInitializingNavigation = true;
+    _navigationInitialized = true;
+    _hasAnnouncedStartingNavigation = true;
+    
+    _logInfo('✅✅✅ NAVIGATION INITIALIZED');
+    
+    initializeTurnByTurnNavigation();
+    updateSessionState(NavigationSessionState.navigating);
+    onSessionStarted?.call();
+    
+    _isInitializingNavigation = false;
+    _logInfo('✅ Navigation initialization complete');
+  }
+
+  void _completeNavigationFromFirebase() {
+    _logInfo('Completing navigation from Firebase');
+    _handleArrival();
+    _isSessionActive = false;
+    _navigationInitialized = false;
+    _hasAnnouncedStartingNavigation = false;
+    _hasArrivedAndSessionEnded = true;
+    _isInitializingNavigation = false;
+    _sessionUpdateTimer?.cancel();
+    _sessionUpdateTimer = null;
+    onSessionCompleted?.call();
+    _logInfo('Navigation completed from Firebase');
+  }
+
+  void _cancelNavigationFromFirebase() {
+    _logInfo('Cancelling navigation from Firebase');
+    _isSessionActive = false;
+    _navigationInitialized = false;
+    _hasAnnouncedStartingNavigation = false;
+    _hasArrivedAndSessionEnded = true;
+    _isInitializingNavigation = false;
+    _sessionUpdateTimer?.cancel();
+    _sessionUpdateTimer = null;
+    clearRoute();
+    onSessionCancelled?.call();
+    speak('Navigation cancelled by request');
+    _logInfo('Navigation cancelled from Firebase');
+  }
+
+  // ============================================================
+  // GET SESSION STATUS
+  // ============================================================
+  Map<String, dynamic> getSessionStatus() {
+    return {
+      'isActive': _isSessionActive,
+      'sessionId': _currentSessionId,
+      'state': _currentSessionState.toString().split('.').last,
+      'navigationInitialized': _navigationInitialized,
+      'hasAnnouncedStartingNavigation': _hasAnnouncedStartingNavigation,
+      'hasArrived': hasArrived,
+      'hasArrivedAndSessionEnded': _hasArrivedAndSessionEnded,
+      'totalDistance': _sessionData['totalDistance'] ?? 0.0,
+      'totalDuration': _sessionData['totalDuration'] ?? 0,
+      'currentStep': currentStepIndex,
+      'totalSteps': routeSteps.length,
+      'progress': _sessionData['progress'] ?? 0.0,
+      'orderId': _sessionData['orderId'],
+      'customerId': _sessionData['customerId'],
+      'customerName': _sessionData['customerName'],
+    };
+  }
+
+  String getDeliveryStatus() {
+    if (hasArrived || _hasArrivedAndSessionEnded) return 'Delivered ✅';
+    if (!_isSessionActive) return 'Not Started ⏳';
+    if (isNavigating) return 'In Transit 🚗';
+    if (_currentSessionState == NavigationSessionState.paused) return 'Paused ⏸️';
+    if (_currentSessionState == NavigationSessionState.cancelled) return 'Cancelled ❌';
+    return 'Pending ⏳';
+  }
+
+  Future<void> togglePauseNavigation() async {
+    if (!_isSessionActive) {
+      _logWarning('No active session to pause');
+      return;
+    }
+
+    if (_currentSessionState == NavigationSessionState.paused) {
+      await updateSessionState(NavigationSessionState.navigating);
+      isNavigating = true;
+      speak('Resuming navigation');
+      _startTurnAlerts();
+    } else if (_currentSessionState == NavigationSessionState.navigating) {
+      await updateSessionState(NavigationSessionState.paused);
+      isNavigating = false;
+      turnAlertTimer?.cancel();
+      speak('Navigation paused');
+    } else {
+      _logWarning('Cannot toggle pause in current state: $_currentSessionState');
+    }
+  }
+
+  void _startTurnAlerts() {
+    turnAlertTimer?.cancel();
+    turnAlertTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+      _checkTurnAlerts();
+    });
+  }
+
+  Future<void> forceSessionUpdate() async {
+    if (_isSessionActive) {
+      await updateSessionProgress();
+    }
+  }
+
+  Map<String, dynamic> getSessionData() {
+    return Map<String, dynamic>.from(_sessionData);
+  }
+
+  bool isSessionActive() => _isSessionActive;
+
+  Future<void> cancelCurrentSession() async {
+    if (_isSessionActive) {
+      await endNavigationSession(cancelled: true);
+      speak('Navigation cancelled');
+    }
+  }
+
+  // ============================================================
+  // DRAW ROUTE TO CUSTOMER - ENHANCED WITH ARRIVAL LISTENER
+  // ============================================================
+  Future<void> drawRouteToCustomer(
+    LatLng origin,
+    LatLng destination,
+    String vehicleType,
+    String numberPlate, {
+    String? orderId,
+    String? customerId,
+    String? customerName,
+  }) async {
+    if (_isSessionActive && _navigationInitialized && isNavigating) {
+      _logWarning('Navigation already active, skipping drawRouteToCustomer');
+      return;
+    }
+    
+    if (_isInitializingNavigation) {
+      _logWarning('Navigation initialization already in progress, skipping...');
+      return;
+    }
+
+    _logInfo('drawRouteToCustomer called - drawing new route');
+    
+    customerLocation = destination;
+    driverLocation = origin;
+
+    // ✅ Reset arrival flag when starting new route
+    hasArrived = false;
+    _hasArrivedAndSessionEnded = false;
+
+    polylines.clear();
+    routeSteps.clear();
+    alternativeRoutes.clear();
+    alternativeDurations.clear();
+    trafficSegments.clear();
+
+    setCustomerMarker(destination);
+    await updateDriverMarker(vehicleType, numberPlate);
+
+    _startTimer('routeParsing');
+    final result = await _withRetry(
+      () => getRouteWithDetails(origin, destination, getAlternatives: true),
+      operationName: 'Route fetch',
+    );
+    final routePoints = result['points'] as List<LatLng>;
+    final duration = result['duration'] as Duration?;
+    final durationText = result['durationText'] as String?;
+    final steps = result['steps'] as List<NavigationStep>;
+    final alternatives = result['alternatives'] as List<List<LatLng>>? ?? [];
+    final altDurations = result['alternativeDurations'] as List<Duration>? ?? [];
+    _stopTimer('routeParsing');
+
+    currentRoutePoints = routePoints;
+    lastRouteOrigin = origin;
+    lastRouteDestination = destination;
+    actualTravelDuration = duration;
+    travelDurationText = durationText;
+    useActualEta = duration != null;
+    alternativeRoutes = alternatives;
+    alternativeDurations = altDurations;
+    selectedRouteIndex = 0;
+
+    if (routePoints.isNotEmpty) {
+      polylines = _buildPolylinesWithTraffic(routePoints);
+      polylines.addAll(_buildAlternativePolylines(alternatives));
+    } else {
+      _logWarning('Route points empty, using fallback route');
+      polylines = _buildFallbackRoute(origin, destination);
+    }
+
+    distanceToCustomer = Geolocator.distanceBetween(
+      origin.latitude,
+      origin.longitude,
+      destination.latitude,
+      destination.longitude,
+    ) / 1000;
+
+    if (duration != null) {
+      estimatedMinutes = duration.inMinutes > 0 ? duration.inMinutes : 1;
+    } else {
+      estimatedMinutes = ((distanceToCustomer! / 40) * 60).ceil();
+    }
+
+    if (steps.isNotEmpty) {
+      routeSteps = steps;
+
+      if (orderId != null && customerId != null && driverId != null) {
+        try {
+          await createNavigationSession(
+            orderId: orderId,
+            customerId: customerId,
+            customerName: customerName ?? 'Customer',
+            origin: origin,
+            destination: destination,
+            vehicleType: vehicleType,
+            numberPlate: numberPlate,
+          );
+          _initializeNavigation();
+        } catch (e) {
+          _logError('Session creation error', details: {'error': e.toString()});
+          onSessionError?.call(e.toString());
+          initializeTurnByTurnNavigation();
+        }
+      } else {
+        initializeTurnByTurnNavigation();
+      }
+    } else {
+      _logWarning('No steps available for route');
+    }
+
+    _updateMapPadding();
+    startCameraFollowing();
+    startTrafficMonitoring();
+    startSpeedLimitMonitoring();
+    initializeAnimationUpdates();
+
+    // ✅ Start arrival listener to stop route refreshing when destination reached
+    _startArrivalListener();
+
+    onMapUpdated?.call();
+  }
+
+  // ============================================================
+  // ✅ ADDED: Arrival Listener to stop route refresh
+  // ============================================================
+  void _startArrivalListener() {
+    // Cancel any existing timer
+    _arrivalCheckTimer?.cancel();
+    
+    // Start periodic check for arrival
+    _arrivalCheckTimer = Timer.periodic(const Duration(seconds: 2), (timer) {
+      // If already arrived, stop checking
+      if (hasArrived || _hasArrivedAndSessionEnded) {
+        timer.cancel();
+        _arrivalCheckTimer = null;
+        _logInfo('✅ Arrival detected - stopping route refresh listener');
+        return;
+      }
+      
+      // Check if driver has arrived at destination
+      if (driverLocation != null && customerLocation != null) {
+        final distance = Geolocator.distanceBetween(
+          driverLocation!.latitude,
+          driverLocation!.longitude,
+          customerLocation!.latitude,
+          customerLocation!.longitude,
+        );
+        
+        // If within 100 meters, consider arrived
+        if (distance < 100) {
+          _logInfo('📍 Driver is within 100m of destination - triggering arrival');
+          // Cancel the timer immediately
+          timer.cancel();
+          _arrivalCheckTimer = null;
+          // Mark as arrived to stop all route refreshes
+          hasArrived = true;
+          _hasArrivedAndSessionEnded = true;
+          // Stop all route recalculation
+          routeRecalculationTimer?.cancel();
+          routeRecalculationTimer = null;
+          isRecalculatingRoute = false;
+          // Update UI
+          onMapUpdated?.call();
+          _logInfo('✅ Route refresh stopped - destination reached');
+        }
+      }
+    });
+  }
+
+  // ============================================================
+  // CLEAR ROUTE - ENHANCED WITH SESSION
+  // ============================================================
+  void clearRoute() {
+    _logInfo('Clearing route');
+    polylines.clear();
+    currentRoutePoints.clear();
+    routeSteps.clear();
+    isNavigating = false;
+    currentStepIndex = 0;
+    alternativeRoutes.clear();
+    alternativeDurations.clear();
+    selectedRouteIndex = 0;
+    trafficSegments.clear();
+    
+    // ✅ Cancel arrival listener when route is cleared
+    _arrivalCheckTimer?.cancel();
+    _arrivalCheckTimer = null;
+    
+    if (!_isSessionActive) {
+      _navigationInitialized = false;
+      _hasAnnouncedStartingNavigation = false;
+      _isInitializingNavigation = false;
+    }
+    hasArrived = false;
+
+    if (_isSessionActive) {
+      endNavigationSession(cancelled: true);
+    }
+
+    onMapUpdated?.call();
+  }
+
+  // ============================================================
+  // RECALCULATE ROUTE - ENHANCED WITH ARRIVAL CHECK
+  // ============================================================
+  void recalculateRouteIfNeeded(LatLng driverPosition, String vehicleType, String numberPlate) {
+    // ✅ If arrived, do NOT recalculate
+    if (hasArrived || _hasArrivedAndSessionEnded) {
+      return;
+    }
+    
+    if (!_navigationInitialized) {
+      return;
+    }
+    
+    if (routeRecalculationTimer != null && routeRecalculationTimer!.isActive) {
+      return;
+    }
+    if (isRecalculatingRoute) return;
+    if (currentRoutePoints.isEmpty) return;
+
+    if (isDriverOffRoute(driverPosition, currentRoutePoints)) {
+      _logInfo('🔄 Driver is off-route, recalculating...');
+      isRecalculatingRoute = true;
+      _startTimer('routeRecalculation');
+
+      if (_isSessionActive) {
+        updateSessionProgress();
+      }
+
+      routeRecalculationTimer = Timer(const Duration(seconds: 3), () async {
+        // ✅ Double-check arrival before recalculating
+        if (hasArrived || _hasArrivedAndSessionEnded) {
+          isRecalculatingRoute = false;
+          _logInfo('⏹️ Skip recalculation - already arrived');
+          return;
+        }
+        
+        if (driverLocation != null && customerLocation != null) {
+          final origin = driverLocation!;
+          final destination = customerLocation!;
+
+          final result = await _withRetry(
+            () => getRouteWithDetails(origin, destination, getAlternatives: true),
+            operationName: 'Route recalculation',
+          );
+          final points = result['points'] as List<LatLng>;
+          final duration = result['duration'] as Duration?;
+          final durationText = result['durationText'] as String?;
+          final steps = result['steps'] as List<NavigationStep>;
+          final alternatives = result['alternatives'] as List<List<LatLng>>? ?? [];
+          final altDurations = result['alternativeDurations'] as List<Duration>? ?? [];
+
+          if (points.isNotEmpty) {
+            currentRoutePoints = points;
+            lastRouteOrigin = origin;
+            lastRouteDestination = destination;
+            actualTravelDuration = duration;
+            travelDurationText = durationText;
+            useActualEta = duration != null;
+            alternativeRoutes = alternatives;
+            alternativeDurations = altDurations;
+            selectedRouteIndex = 0;
+
+            polylines = _buildPolylinesWithTraffic(points);
+            polylines.addAll(_buildAlternativePolylines(alternatives));
+
+            if (steps.isNotEmpty) {
+              routeSteps = steps;
+              if (_isSessionActive && !_navigationInitialized) {
+                _initializeNavigation();
+                updateSessionState(NavigationSessionState.navigating);
+              } else if (!_navigationInitialized) {
+                initializeTurnByTurnNavigation();
+              } else {
+                _updateCurrentStepInfo();
+              }
+            }
+
+            if (duration != null) {
+              estimatedMinutes = duration.inMinutes > 0 ? duration.inMinutes : 1;
+            }
+
+            speak('Route recalculated.');
+            onMapUpdated?.call();
+            _logInfo('✅ Route recalculated successfully');
+          } else {
+            _logWarning('Route recalculation failed - no points returned');
+          }
+        }
+        isRecalculatingRoute = false;
+        _stopTimer('routeRecalculation');
+      });
+    }
+  }
+
+  // ============================================================
+  // HANDLE ARRIVAL - PREVENT DUPLICATES
+  // ============================================================
+  void _handleArrival() {
+    if (hasArrived || _hasArrivedAndSessionEnded) {
+      _logWarning('Arrival already handled, skipping...');
+      return;
+    }
+    
+    _startTimer('arrivalDetection');
+    _logInfo('✅ Driver has arrived at destination');
+    hasArrived = true;
+    _hasArrivedAndSessionEnded = true;
+    
+    // ✅ Cancel arrival listener on arrival
+    _arrivalCheckTimer?.cancel();
+    _arrivalCheckTimer = null;
+    
+    speak('You have arrived at your destination.');
+    onTurnAlert?.call('📍 You have arrived!', 'success');
+    showNavigationBanner = false;
+    isCameraFollowing = false;
+
+    if (_isSessionActive) {
+      endNavigationSession(cancelled: false);
+    }
+
+    if (mapController != null) {
+      mapController!.animateCamera(
+        CameraUpdate.newCameraPosition(
+          CameraPosition(
+            target: driverLocation ?? customerLocation!,
+            zoom: 16,
+            tilt: 0,
+          ),
+        ),
+      );
+    }
+
+    onMapUpdated?.call();
+    _stopTimer('arrivalDetection');
+  }
+
+  // ============================================================
+  // INITIALIZE TURN-BY-TURN NAVIGATION - PREVENT DUPLICATES
+  // ============================================================
+  void initializeTurnByTurnNavigation() {
+    if (_navigationInitialized && isNavigating) {
+      _logWarning('Navigation already initialized, skipping duplicate init');
+      _updateCurrentStepInfo();
+      return;
+    }
+
+    currentStepIndex = 0;
+    isNavigating = routeSteps.isNotEmpty;
+    hasAnnouncedCurrentStep = false;
+    lastAnnouncementDistance = -1;
+    announcementQueue.clear();
+
+    if (routeSteps.isNotEmpty) {
+      _updateCurrentStepInfo();
+
+      if (!_navigationInitialized && !_hasAnnouncedStartingNavigation) {
+        _navigationInitialized = true;
+        _hasAnnouncedStartingNavigation = true;
+        
+        final totalDistance = routeSteps.fold(0.0, (sum, step) => sum + step.distance);
+        final totalTime = routeSteps.fold(Duration.zero, (sum, step) => sum + step.duration);
+        
+        if (totalDistance > 10) {
+          speak('Starting navigation. Total distance ${_formatDistance(totalDistance)}, approximately ${totalTime.inMinutes} minutes.');
+        } else {
+          speak('Starting navigation to nearby destination.');
+        }
+
+        final firstStep = routeSteps[0];
+        _speakInstruction(firstStep);
+        _logInfo('"Starting navigation" spoken once');
+      } else if (_navigationInitialized && _hasAnnouncedStartingNavigation) {
+        final firstStep = routeSteps[0];
+        _speakInstruction(firstStep);
+      } else {
+        _navigationInitialized = true;
+        _hasAnnouncedStartingNavigation = true;
+        final firstStep = routeSteps[0];
+        _speakInstruction(firstStep);
+      }
+    }
+
+    showNavigationBanner = routeSteps.isNotEmpty;
+    bannerProgress = 0.0;
+
+    turnAlertTimer?.cancel();
+    turnAlertTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+      _checkTurnAlerts();
+    });
+  }
+
+  // ============================================================
+  // ORIGINAL METHODS - PRESERVED
+  // ============================================================
+
+  // ============================================================
+  // FIREBASE LOCATION METHODS
+  // ============================================================
+  void initializeFirestoreListener(String driverId) {
+    this.driverId = driverId;
+    driverLocationRef = firestore.collection('drivers').doc(driverId);
+    driverLocationRef!.snapshots(
+      includeMetadataChanges: false,
+    ).listen((snapshot) {
+      if (snapshot.exists) {
+        final data = snapshot.data() as Map<String, dynamic>?;
+        if (data == null) return;
+        if (data['position'] is GeoPoint) {
+          final geoPoint = data['position'] as GeoPoint;
+          final position = LatLng(geoPoint.latitude, geoPoint.longitude);
+          final heading = (data['heading'] as double?) ?? 0.0;
+          final speed = (data['speed'] as double?) ?? 0.0;
+          _processRemoteLocationUpdate(position, heading, speed);
+        } else if (data['position'] is Map) {
+          final pos = data['position'] as Map<String, dynamic>;
+          final position = LatLng(
+            (pos['lat'] as num).toDouble(),
+            (pos['lng'] as num).toDouble(),
+          );
+          final heading = (data['heading'] as double?) ?? 0.0;
+          final speed = (data['speed'] as double?) ?? 0.0;
+          _processRemoteLocationUpdate(position, heading, speed);
+        }
+      }
+    }, onError: (error) {
+      _logError('Firestore listener error', details: {'error': error.toString()});
+    });
+  }
+
+  void _processRemoteLocationUpdate(LatLng position, double heading, double speed) {
+    if (driverId != null && _currentVehicleType != null && _currentNumberPlate != null) {
+      bool isMoving = speed > 2.0;
+      updateAnimatedDriver(
+        driverId: driverId!,
+        position: position,
+        heading: heading,
+        speed: speed,
+        vehicleType: _currentVehicleType!,
+        numberPlate: _currentNumberPlate!,
+        isMoving: isMoving,
+      );
+    }
+    _handleLocationUpdate(position, heading, speed);
+  }
+
+  Future<void> sendLocationToFirestore({
+    required LatLng position,
+    required double heading,
+    required double speed,
+    bool force = false,
+  }) async {
+    if (driverLocationRef == null) return;
+
+    final now = DateTime.now();
+    if (!force) {
+      if (lastSentPosition != null) {
+        final distance = Geolocator.distanceBetween(
+          lastSentPosition!.latitude,
+          lastSentPosition!.longitude,
+          position.latitude,
+          position.longitude,
+        );
+        if (distance < minDistanceThreshold) {
+          return;
+        }
+      }
+      if (lastFirestoreUpdateTime != null) {
+        final elapsed = now.difference(lastFirestoreUpdateTime!);
+        if (elapsed < minTimeThreshold) {
+          _queueFirestoreUpdate(position, heading, speed);
+          return;
+        }
+      }
+    }
+    await _sendLocationUpdate(position, heading, speed);
+  }
+
+  void _queueFirestoreUpdate(LatLng position, double heading, double speed) {
+    queuedPosition = position;
+    queuedHeading = heading;
+    queuedSpeed = speed;
+    isFirestoreUpdateQueued = true;
+    firestoreDebounceTimer?.cancel();
+    firestoreDebounceTimer = Timer(minTimeThreshold, () {
+      if (isFirestoreUpdateQueued && queuedPosition != null) {
+        _sendLocationUpdate(
+          queuedPosition!,
+          queuedHeading ?? 0.0,
+          queuedSpeed ?? 0.0,
+        );
+        isFirestoreUpdateQueued = false;
+        queuedPosition = null;
+        queuedHeading = null;
+        queuedSpeed = null;
+      }
+    });
+  }
+
+  Future<void> _sendLocationUpdate(LatLng position, double heading, double speed) async {
+    if (driverLocationRef == null) return;
+    try {
+      final now = DateTime.now();
+      await driverLocationRef!.set({
+        'position': {
+          'lat': position.latitude,
+          'lng': position.longitude,
+        },
+        'heading': heading,
+        'speed': speed,
+        'timestamp': FieldValue.serverTimestamp(),
+        'updatedAt': now.toIso8601String(),
+      }, SetOptions(merge: true));
+      lastSentPosition = position;
+      lastFirestoreUpdateTime = now;
+      isFirestoreUpdateQueued = false;
+      _logInfo('Firestore update sent: ${position.latitude}, ${position.longitude}');
+    } catch (e) {
+      _logError('Error sending location to Firestore', details: {'error': e.toString()});
+    }
+  }
+
+  Future<void> forceFirestoreUpdate({
+    required LatLng position,
+    required double heading,
+    required double speed,
+  }) async {
+    await sendLocationToFirestore(
+      position: position,
+      heading: heading,
+      speed: speed,
+      force: true,
+    );
+  }
+
+  Map<String, dynamic> getFirestoreStats() {
+    return {
+      'lastSentPosition': lastSentPosition,
+      'minDistanceThreshold': minDistanceThreshold,
+      'minTimeThreshold': minTimeThreshold.inSeconds,
+      'lastUpdateTime': lastFirestoreUpdateTime?.toIso8601String(),
+      'isQueued': isFirestoreUpdateQueued,
+      'queuedPosition': queuedPosition,
+    };
+  }
+
+  // ============================================================
+  // UPDATE MAP PADDING
+  // ============================================================
+  void _updateMapPadding() {
+    if (_context != null) {
+      final mediaQuery = MediaQuery.of(_context!);
+      screenHeight = mediaQuery.size.height;
+      screenWidth = mediaQuery.size.width;
+    } else {
+      screenHeight = 800;
+      screenWidth = 400;
+    }
+    mapPadding = EdgeInsets.only(
+      top: screenHeight * 0.08,
+      bottom: screenHeight * 0.30,
+      left: screenWidth * 0.02,
+      right: screenWidth * 0.02,
+    );
+  }
+
+  // ============================================================
+  // VEHICLE MARKER - WITH OPTIMIZED CACHING
+  // ============================================================
+  Future<BitmapDescriptor> _getVehicleMarker(String vehicleType, {double bearing = 0}) async {
+    _startTimer('markerGeneration');
+    final smoothBearing = _smoothBearing(bearing);
+    final String key = 'car_${vehicleType}_${smoothBearing.round()}_${carWidth.round()}_${carHeight.round()}';
+    
+    if (markerCache.containsKey(key)) {
+      _stopTimer('markerGeneration');
+      return markerCache[key]!;
+    }
+    
+    try {
+      final ByteData? data = await rootBundle.load('assets/car3.png');
+      if (data == null) {
+        final marker = await _createEmojiFallback(vehicleType);
+        markerCache[key] = marker;
+        _stopTimer('markerGeneration');
+        return marker;
+      }
+      
+      final int width = carWidth.toInt();
+      final int height = carHeight.toInt();
+      final codec = await ui.instantiateImageCodec(
+        data.buffer.asUint8List(),
+      );
+      final frame = await codec.getNextFrame();
+      final originalImage = frame.image;
+      
+      final stretchRecorder = ui.PictureRecorder();
+      final stretchCanvas = Canvas(stretchRecorder);
+      stretchCanvas.drawImageRect(
+        originalImage,
+        Rect.fromLTWH(0, 0, originalImage.width.toDouble(), originalImage.height.toDouble()),
+        Rect.fromLTWH(0, 0, width.toDouble(), height.toDouble()),
+        Paint(),
+      );
+      final stretchedImage = await stretchRecorder.endRecording().toImage(width, height);
+      
+      final rotateRecorder = ui.PictureRecorder();
+      final rotateCanvas = Canvas(rotateRecorder);
+      rotateCanvas.save();
+      rotateCanvas.translate(width / 2, height / 2);
+      rotateCanvas.rotate(smoothBearing * pi / 180);
+      rotateCanvas.translate(-width / 2, -height / 2);
+      rotateCanvas.drawImage(stretchedImage, Offset(0, 0), Paint());
+      rotateCanvas.restore();
+      
+      final finalImage = await rotateRecorder.endRecording().toImage(width, height);
+      final ByteData? imageData = await finalImage.toByteData(format: ui.ImageByteFormat.png);
+      if (imageData == null) {
+        final marker = await _createEmojiFallback(vehicleType);
+        markerCache[key] = marker;
+        _stopTimer('markerGeneration');
+        return marker;
+      }
+      
+      final marker = BitmapDescriptor.fromBytes(imageData.buffer.asUint8List());
+      markerCache[key] = marker;
+      _stopTimer('markerGeneration');
+      return marker;
+    } catch (e) {
+      _logWarning('Error loading car3.png, using emoji fallback', details: {'error': e.toString()});
+      final marker = await _createEmojiFallback(vehicleType);
+      markerCache[key] = marker;
+      _stopTimer('markerGeneration');
+      return marker;
+    }
+  }
+
+  double _smoothBearing(double bearing) {
+    if (headingHistory.isEmpty) {
+      headingHistory.add(bearing);
+      return bearing;
+    }
+    headingHistory.add(bearing);
+    if (headingHistory.length > maxHeadingHistory) {
+      headingHistory.removeAt(0);
+    }
+    double sum = 0;
+    double weight = 1;
+    for (int i = headingHistory.length - 1; i >= 0; i--) {
+      sum += headingHistory[i] * weight;
+      weight *= 0.7;
+    }
+    final smooth = sum / headingHistory.fold(0, (a, b) => a + 1);
+    return smooth % 360;
+  }
+
+  Future<BitmapDescriptor> _createEmojiFallback(String vehicleType) async {
+    final String key = 'emoji_$vehicleType';
+    if (markerCache.containsKey(key)) return markerCache[key]!;
+    final recorder = ui.PictureRecorder();
+    final canvas = Canvas(recorder);
+    Color color;
+    switch (vehicleType.toLowerCase()) {
+      case 'small':
+        color = Colors.orange;
+        break;
+      case 'medium':
+      case 'fuel truck':
+        color = Colors.blue;
+        break;
+      case 'large':
+      case 'big':
+        color = Colors.green;
+        break;
+      default:
+        color = Colors.blue;
+    }
+    canvas.drawCircle(const Offset(40, 40), 36, Paint()..color = color);
+    canvas.drawCircle(const Offset(40, 40), 36, Paint()..color = Colors.white..style = PaintingStyle.stroke..strokeWidth = 4);
+    final emoji = _getVehicleIcon(vehicleType);
+    final painter = TextPainter(
+      text: TextSpan(
+        text: emoji,
+        style: const TextStyle(fontSize: 40, color: Colors.white, fontWeight: FontWeight.bold)
+      ),
+      textDirection: TextDirection.ltr
+    );
+    painter.layout();
+    painter.paint(canvas, Offset(40 - painter.width / 2, 40 - painter.height / 2));
+    final img = await recorder.endRecording().toImage(80, 80);
+    final ByteData? data = await img.toByteData(format: ui.ImageByteFormat.png);
+    if (data == null) return BitmapDescriptor.defaultMarker;
+    final marker = BitmapDescriptor.fromBytes(data.buffer.asUint8List());
+    markerCache[key] = marker;
+    return marker;
+  }
+
+  String _getVehicleIcon(String vehicleType) {
+    switch (vehicleType.toLowerCase()) {
+      case 'small':
+        return '🚗';
+      case 'medium':
+      case 'fuel truck':
+        return '🚚';
+      case 'large':
+      case 'big':
+        return '🚛';
+      default:
+        return '🚚';
+    }
+  }
+
+  // ============================================================
+  // UPDATE DRIVER MARKER
+  // ============================================================
+  Future<void> updateDriverMarker(String vehicleType, String numberPlate) async {
+    if (driverLocation == null) return;
+    _currentVehicleType = vehicleType;
+    _currentNumberPlate = numberPlate;
+    try {
+      final markerIcon = await _getVehicleMarker(
+        vehicleType.toLowerCase(),
+        bearing: currentHeading
+      );
+      mapMarkers.removeWhere((marker) => marker.markerId.value == 'driver');
+      mapMarkers.add(
+        Marker(
+          markerId: const MarkerId('driver'),
+          position: driverLocation!,
+          icon: markerIcon,
+          rotation: currentHeading,
+          anchor: const Offset(0.5, 0.9),
+          flat: true,
+          infoWindow: InfoWindow(
+            title: '🚗 Your Location',
+            snippet: '$vehicleType • $numberPlate • ${currentSpeed.toStringAsFixed(0)} km/h',
+          ),
+        ),
+      );
+      if (driverId != null) {
+        bool isMoving = currentSpeed > 2.0;
+        updateAnimatedDriver(
+          driverId: driverId!,
+          position: driverLocation!,
+          heading: currentHeading,
+          speed: currentSpeed,
+          vehicleType: vehicleType,
+          numberPlate: numberPlate,
+          isMoving: isMoving,
+        );
+      }
+      onMapUpdated?.call();
+    } catch (e) {
+      _logError('Error updating driver marker', details: {'error': e.toString()});
+    }
+  }
+
+  void updateDriverMarkerWithInterpolation(String vehicleType, String numberPlate) {
+    if (driverLocation == null) return;
+    _currentVehicleType = vehicleType;
+    _currentNumberPlate = numberPlate;
+    _getVehicleMarker(vehicleType.toLowerCase(), bearing: currentHeading).then((markerIcon) {
+      mapMarkers.removeWhere((marker) => marker.markerId.value == 'driver');
+      mapMarkers.add(
+        Marker(
+          markerId: const MarkerId('driver'),
+          position: driverLocation!,
+          icon: markerIcon,
+          rotation: currentHeading,
+          anchor: const Offset(0.5, 0.9),
+          flat: true,
+          infoWindow: InfoWindow(
+            title: '🚗 Your Location',
+            snippet: '$vehicleType • $numberPlate • ${currentSpeed.toStringAsFixed(0)} km/h',
+          ),
+        ),
+      );
+      if (driverId != null) {
+        bool isMoving = currentSpeed > 2.0;
+        updateAnimatedDriver(
+          driverId: driverId!,
+          position: driverLocation!,
+          heading: currentHeading,
+          speed: currentSpeed,
+          vehicleType: vehicleType,
+          numberPlate: numberPlate,
+          isMoving: isMoving,
+        );
+      }
+      onMapUpdated?.call();
+    });
+  }
+
+  void forceUpdateMarker(String vehicleType, String numberPlate) {
+    if (driverLocation == null) return;
+    _currentVehicleType = vehicleType;
+    _currentNumberPlate = numberPlate;
+    _getVehicleMarker(vehicleType.toLowerCase(), bearing: currentHeading).then((markerIcon) {
+      mapMarkers.removeWhere((marker) => marker.markerId.value == 'driver');
+      mapMarkers.add(
+        Marker(
+          markerId: const MarkerId('driver'),
+          position: driverLocation!,
+          icon: markerIcon,
+          rotation: currentHeading,
+          anchor: const Offset(0.5, 0.9),
+          flat: true,
+          infoWindow: InfoWindow(
+            title: '🚗 Your Location',
+            snippet: '$vehicleType • $numberPlate • ${currentSpeed.toStringAsFixed(0)} km/h',
+          ),
+        ),
+      );
+      if (driverId != null) {
+        bool isMoving = currentSpeed > 2.0;
+        updateAnimatedDriver(
+          driverId: driverId!,
+          position: driverLocation!,
+          heading: currentHeading,
+          speed: currentSpeed,
+          vehicleType: vehicleType,
+          numberPlate: numberPlate,
+          isMoving: isMoving,
+        );
+      }
+      onMapUpdated?.call();
+    });
+    _updateCameraPosition();
+  }
+
+  // ============================================================
+  // SET CUSTOMER MARKER
+  // ============================================================
+  void setCustomerMarker(LatLng location) {
+    customerLocation = location;
+    mapMarkers.removeWhere((marker) => marker.markerId.value == 'customer');
+    mapMarkers.add(
+      Marker(
+        markerId: const MarkerId('customer'),
+        position: location,
+        infoWindow: const InfoWindow(title: '📍 Customer Location'),
+        icon: BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueGreen),
+      ),
+    );
+    onMapUpdated?.call();
+  }
+
+  // ============================================================
+  // CLEAR MARKERS
+  // ============================================================
+  void clearMarkers() {
+    mapMarkers.clear();
+    animatedMarkers.clear();
+    _animatedDrivers.clear();
+    _driverPaths.clear();
+    _staticDrivers.clear();
+    onMapUpdated?.call();
+  }
+
+  // ============================================================
+  // GOOGLE DIRECTIONS API - FIXED: Returns empty response instead of throwing
+  // ============================================================
+  Future<Map<String, dynamic>> getRouteWithDetails(
+    LatLng origin,
+    LatLng destination, {
+    bool getAlternatives = true
+  }) async {
+    try {
+      String baseUrl = 'https://maps.googleapis.com/maps/api/directions/json?origin=${origin.latitude},${origin.longitude}'
+          '&destination=${destination.latitude},${destination.longitude}'
+          '&key=$googleAPIKey'
+          '&departure_time=now'
+          '&traffic_model=best_guess';
+      if (getAlternatives) {
+        baseUrl += '&alternatives=true';
+      }
+      String url = baseUrl;
+      if (useCorsProxy) {
+        url = '$corsProxyUrl$baseUrl';
+      }
+      
+      _logInfo('Fetching route from: $url');
+      
+      final response = await http.get(
+        Uri.parse(url),
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Requested-With': 'XMLHttpRequest',
+        },
+      ).timeout(
+        const Duration(seconds: 30),
+        onTimeout: () {
+          _logError('Route request timed out');
+          return http.Response('{"status":"TIMEOUT"}', 408);
+        },
+      );
+      
+      _logInfo('Route response status: ${response.statusCode}');
+      
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+        
+        if (data['status'] == 'OK') {
+          _logInfo('Route found!');
+          return _parseRouteResponse(data, getAlternatives);
+        } else if (data['status'] == 'ZERO_RESULTS') {
+          _logWarning('No route found between these points');
+          return _emptyRouteResponse();
+        } else {
+          _logWarning('API Error: ${data['status']} - ${data['error_message'] ?? 'No message'}');
+          return _emptyRouteResponse();
+        }
+      } else {
+        _logWarning('HTTP Error: ${response.statusCode}');
+        return _emptyRouteResponse();
+      }
+    } catch (e) {
+      _logError('Route fetch error', details: {'error': e.toString()});
+      return _emptyRouteResponse();
+    }
+  }
+
+  // ✅ FIXED: Complete implementation of direct route fetch
+  Future<Map<String, dynamic>> _getRouteDirect(
+    LatLng origin,
+    LatLng destination,
+    bool getAlternatives
+  ) async {
+    try {
+      String url = 'https://maps.googleapis.com/maps/api/directions/json?origin=${origin.latitude},${origin.longitude}'
+          '&destination=${destination.latitude},${destination.longitude}'
+          '&key=$googleAPIKey'
+          '&departure_time=now'
+          '&traffic_model=best_guess';
+      if (getAlternatives) {
+        url += '&alternatives=true';
+      }
+      final response = await http.get(Uri.parse(url)).timeout(
+        const Duration(seconds: 20),
+      );
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+        if (data['status'] == 'OK') {
+          return _parseRouteResponse(data, getAlternatives);
+        }
+      }
+      return _emptyRouteResponse();
+    } catch (e) {
+      _logError('Direct request error', details: {'error': e.toString()});
+      return _emptyRouteResponse();
+    }
+  }
+
+  Map<String, dynamic> _parseRouteResponse(Map<String, dynamic> data, bool getAlternatives) {
+    try {
+      final routes = data['routes'] as List;
+      final mainRoute = routes[0];
+      final overviewPolyline = mainRoute['overview_polyline']['points'];
+      final points = _decodePolyline(overviewPolyline);
+      Duration? travelDuration;
+      String? durationText;
+      List<NavigationStep> steps = [];
+      if (mainRoute['legs'] != null && mainRoute['legs'].isNotEmpty) {
+        final leg = mainRoute['legs'][0];
+        if (leg['duration'] != null) {
+          final seconds = leg['duration']['value'] as int;
+          travelDuration = Duration(seconds: seconds);
+          durationText = leg['duration']['text'] as String?;
+        }
+        if (leg['steps'] != null) {
+          for (int i = 0; i < leg['steps'].length; i++) {
+            final step = leg['steps'][i];
+            final stepPoints = _decodePolyline(step['polyline']['points']);
+            final instruction = step['html_instructions'] ?? step['instructions'] ?? 'Continue';
+            
+            String roadName = '';
+            final matches = RegExp(r'onto\s+([^<]+)').firstMatch(instruction);
+            if (matches != null && matches.group(1) != null) {
+              roadName = matches.group(1)!.trim();
+            } else {
+              final parts = instruction.split(' ');
+              if (parts.length > 2) {
+                roadName = parts.sublist(2).join(' ').replaceAll('<b>', '').replaceAll('</b>', '');
+              }
+            }
+            
+            String roadShield = '';
+            final shieldMatches = RegExp(r'([A-Z]\d{1,4})').firstMatch(roadName);
+            if (shieldMatches != null) {
+              roadShield = shieldMatches.group(1)!;
+            }
+            
+            String maneuver = step['maneuver'] ?? 'straight';
+            double startHeading = 0;
+            double endHeading = 0;
+            if (stepPoints.length >= 2) {
+              startHeading = _calculateBearing(
+                stepPoints[0],
+                stepPoints[min(1, stepPoints.length - 1)]
+              );
+              endHeading = _calculateBearing(
+                stepPoints[max(0, stepPoints.length - 2)],
+                stepPoints.last
+              );
+            }
+            
+            if (i < leg['steps'].length - 1) {
+              final nextStep = leg['steps'][i + 1];
+              final nextStepPoints = _decodePolyline(nextStep['polyline']['points']);
+              double nextStartHeading = 0;
+              if (nextStepPoints.length >= 2) {
+                nextStartHeading = _calculateBearing(
+                  nextStepPoints[0],
+                  nextStepPoints[min(1, nextStepPoints.length - 1)]
+                );
+              }
+              double turnAngle = (nextStartHeading - endHeading).abs() % 360;
+              if (turnAngle > 180) turnAngle = 360 - turnAngle;
+              
+              if (turnAngle > 30 && turnAngle < 80) {
+                final cross = _crossProduct(
+                  stepPoints.last,
+                  stepPoints[max(0, stepPoints.length - 2)],
+                  nextStepPoints[min(1, nextStepPoints.length - 1)]
+                );
+                maneuver = cross > 0 ? 'turn-left' : 'turn-right';
+              } else if (turnAngle >= 80) {
+                final cross = _crossProduct(
+                  stepPoints.last,
+                  stepPoints[max(0, stepPoints.length - 2)],
+                  nextStepPoints[min(1, nextStepPoints.length - 1)]
+                );
+                maneuver = cross > 0 ? 'turn-sharp-left' : 'turn-sharp-right';
+              } else if (turnAngle > 5 && turnAngle <= 30) {
+                final cross = _crossProduct(
+                  stepPoints.last,
+                  stepPoints[max(0, stepPoints.length - 2)],
+                  nextStepPoints[min(1, nextStepPoints.length - 1)]
+                );
+                maneuver = cross > 0 ? 'turn-slight-left' : 'turn-slight-right';
+              }
+            }
+            
+            if (instruction.toLowerCase().contains('turn left') || instruction.toLowerCase().contains('turn-left')) {
+              maneuver = 'turn-left';
+            } else if (instruction.toLowerCase().contains('turn right') || instruction.toLowerCase().contains('turn-right')) {
+              maneuver = 'turn-right';
+            }
+            
+            List<LaneInfo> lanes = _getLaneInfo(maneuver);
+            steps.add(NavigationStep(
+              instruction: instruction.replaceAll(RegExp(r'<[^>]*>'), ''),
+              maneuver: maneuver,
+              distance: (step['distance']['value'] as int).toDouble(),
+              distanceText: step['distance']['text'] ?? '',
+              duration: Duration(seconds: step['duration']['value'] as int),
+              durationText: step['duration']['text'] ?? '',
+              startLocation: LatLng(
+                step['start_location']['lat'] as double,
+                step['start_location']['lng'] as double,
+              ),
+              endLocation: LatLng(
+                step['end_location']['lat'] as double,
+                step['end_location']['lng'] as double,
+              ),
+              points: stepPoints,
+              roadName: roadName,
+              roadShield: roadShield,
+              lanes: lanes,
+              startHeading: startHeading,
+              endHeading: endHeading,
+            ));
+          }
+        }
+      }
+      
+      List<List<LatLng>> alternatives = [];
+      List<Duration> altDurations = [];
+      if (getAlternatives && routes.length > 1) {
+        for (int i = 1; i < routes.length && i < 3; i++) {
+          final route = routes[i];
+          final altPolyline = route['overview_polyline']['points'];
+          final altPoints = _decodePolyline(altPolyline);
+          alternatives.add(altPoints);
+          if (route['legs'] != null && route['legs'].isNotEmpty) {
+            final leg = route['legs'][0];
+            if (leg['duration'] != null) {
+              final seconds = leg['duration']['value'] as int;
+              altDurations.add(Duration(seconds: seconds));
+            }
+          }
+        }
+      }
+      
+      return {
+        'points': points,
+        'duration': travelDuration,
+        'durationText': durationText,
+        'steps': steps,
+        'alternatives': alternatives,
+        'alternativeDurations': altDurations,
+      };
+    } catch (e) {
+      _logError('Error parsing route', details: {'error': e.toString()});
+      return _emptyRouteResponse();
+    }
+  }
+
+  Map<String, dynamic> _emptyRouteResponse() {
+    return {
+      'points': [],
+      'duration': null,
+      'durationText': null,
+      'steps': [],
+      'alternatives': [],
+      'alternativeDurations': [],
+    };
+  }
+
+  // ============================================================
+  // HELPER METHODS
+  // ============================================================
+  double _calculateBearing(LatLng from, LatLng to) {
+    final lat1 = from.latitude * pi / 180;
+    final lat2 = to.latitude * pi / 180;
+    final dLng = (to.longitude - from.longitude) * pi / 180;
+    final y = sin(dLng) * cos(lat2);
+    final x = cos(lat1) * sin(lat2) - sin(lat1) * cos(lat2) * cos(dLng);
+    return (atan2(y, x) * 180 / pi + 360) % 360;
+  }
+
+  double _crossProduct(LatLng a, LatLng b, LatLng c) {
+    final v1x = b.latitude - a.latitude;
+    final v1y = b.longitude - a.longitude;
+    final v2x = c.latitude - b.latitude;
+    final v2y = c.longitude - b.longitude;
+    return v1x * v2y - v1y * v2x;
+  }
+
+  List<LatLng> _decodePolyline(String encoded) {
+    List<LatLng> poly = [];
+    int index = 0, len = encoded.length;
+    int lat = 0, lng = 0;
+    while (index < len) {
+      int b, shift = 0, result = 0;
+      do {
+        b = encoded.codeUnitAt(index++) - 63;
+        result |= (b & 0x1f) << shift;
+        shift += 5;
+      } while (b >= 0x20);
+      int dlat = ((result & 1) != 0) ? ~(result >> 1) : (result >> 1);
+      lat += dlat;
+      shift = 0;
+      result = 0;
+      do {
+        b = encoded.codeUnitAt(index++) - 63;
+        result |= (b & 0x1f) << shift;
+        shift += 5;
+      } while (b >= 0x20);
+      int dlng = ((result & 1) != 0) ? ~(result >> 1) : (result >> 1);
+      lng += dlng;
+      poly.add(LatLng(lat / 1E5, lng / 1E5));
+    }
+    return poly;
+  }
+
+  // ============================================================
+  // GET LANE INFO
+  // ============================================================
+  List<LaneInfo> _getLaneInfo(String maneuver) {
+    switch (maneuver) {
+      case 'turn-left':
+        return [
+          LaneInfo(left: true, straight: false, right: false, recommended: true, label: '←'),
+          LaneInfo(left: false, straight: true, right: false, label: '↑'),
+          LaneInfo(left: false, straight: true, right: false, label: '↑'),
+        ];
+      case 'turn-right':
+        return [
+          LaneInfo(left: false, straight: true, right: false, label: '↑'),
+          LaneInfo(left: false, straight: true, right: false, label: '↑'),
+          LaneInfo(left: false, straight: false, right: true, recommended: true, label: '→'),
+        ];
+      case 'turn-sharp-left':
+        return [
+          LaneInfo(left: true, straight: false, right: false, recommended: true, label: '←'),
+          LaneInfo(left: false, straight: true, right: false, label: '↑'),
+        ];
+      case 'turn-sharp-right':
+        return [
+          LaneInfo(left: false, straight: true, right: false, label: '↑'),
+          LaneInfo(left: false, straight: false, right: true, recommended: true, label: '→'),
+        ];
+      case 'turn-slight-left':
+        return [
+          LaneInfo(left: true, straight: false, right: false, recommended: true, label: '↖'),
+          LaneInfo(left: false, straight: true, right: false, label: '↑'),
+          LaneInfo(left: false, straight: true, right: false, label: '↑'),
+        ];
+      case 'turn-slight-right':
+        return [
+          LaneInfo(left: false, straight: true, right: false, label: '↑'),
+          LaneInfo(left: false, straight: true, right: false, label: '↑'),
+          LaneInfo(left: false, straight: false, right: true, recommended: true, label: '↗'),
+        ];
+      default:
+        return [
+          LaneInfo(left: false, straight: true, right: false, recommended: true, label: '↑'),
+          LaneInfo(left: false, straight: true, right: false, label: '↑'),
+        ];
+    }
+  }
+
+  // ============================================================
+  // POLYLINES BUILDERS
+  // ============================================================
+  Set<Polyline> _buildPolylinesWithTraffic(List<LatLng> points, {Color? trafficColor}) {
+    final color = trafficColor ?? currentTrafficColor;
+    final polylines = <Polyline>{};
+    polylines.add(
+      Polyline(
+        polylineId: const PolylineId('driver_route_shadow'),
+        points: points,
+        color: Colors.black.withOpacity(0.3),
+        width: 24,
+        startCap: Cap.roundCap,
+        endCap: Cap.roundCap,
+        jointType: JointType.round,
+      ),
+    );
+    polylines.add(
+      Polyline(
+        polylineId: const PolylineId('driver_route'),
+        points: points,
+        color: color,
+        width: 16,
+        startCap: Cap.roundCap,
+        endCap: Cap.roundCap,
+        jointType: JointType.round,
+      ),
+    );
+    polylines.add(
+      Polyline(
+        polylineId: const PolylineId('driver_route_border'),
+        points: points,
+        color: Colors.white.withOpacity(0.3),
+        width: 20,
+        startCap: Cap.roundCap,
+        endCap: Cap.roundCap,
+        jointType: JointType.round,
+      ),
+    );
+    polylines.add(
+      Polyline(
+        polylineId: const PolylineId('driver_route_center'),
+        points: points,
+        color: Colors.white.withOpacity(0.15),
+        width: 3,
+        startCap: Cap.roundCap,
+        endCap: Cap.roundCap,
+        jointType: JointType.round,
+        patterns: [PatternItem.dash(20), PatternItem.gap(15)],
+      ),
+    );
+    return polylines;
+  }
+
+  Set<Polyline> _buildTrafficSegmentedRoute(
+    List<LatLng> points,
+    List<Map<String, dynamic>> trafficData
+  ) {
+    final result = <Polyline>{};
+    for (int i = 0; i < trafficData.length; i++) {
+      final segment = trafficData[i];
+      final segmentPoints = segment['points'] as List<LatLng>;
+      final color = segment['color'] as Color? ?? Colors.green;
+      result.add(
+        Polyline(
+          polylineId: PolylineId('traffic_segment_$i'),
+          points: segmentPoints,
+          color: color,
+          width: 18,
+          startCap: Cap.roundCap,
+          endCap: Cap.roundCap,
+          jointType: JointType.round,
+        ),
+      );
+    }
+    return result;
+  }
+
+  Set<Polyline> _buildPolylines(List<LatLng> points) {
+    return _buildPolylinesWithTraffic(points);
+  }
+
+  Set<Polyline> _buildFallbackRoute(LatLng origin, LatLng destination) {
+    return {
+      Polyline(
+        polylineId: const PolylineId('route'),
+        points: [origin, destination],
+        color: const Color(0xFF1A73E8),
+        width: 16,
+        startCap: Cap.roundCap,
+        endCap: Cap.roundCap,
+      ),
+    };
+  }
+
+  Set<Polyline> _buildAlternativePolylines(List<List<LatLng>> alternatives) {
+    final result = <Polyline>{};
+    for (int i = 0; i < alternatives.length; i++) {
+      final altPoints = alternatives[i];
+      if (altPoints.isEmpty) continue;
+      final isSelected = (i == selectedRouteIndex - 1);
+      result.add(
+        Polyline(
+          polylineId: PolylineId('alternative_$i'),
+          points: altPoints,
+          color: isSelected ? const Color(0xFF1A73E8) : Colors.grey.withOpacity(0.5),
+          width: isSelected ? 14 : 6,
+          startCap: Cap.roundCap,
+          endCap: Cap.roundCap,
+          jointType: JointType.round,
+          patterns: isSelected ? [] : [PatternItem.dash(20), PatternItem.gap(10)],
+        ),
+      );
+    }
+    return result;
+  }
+
+  // ============================================================
+  // SELECT ALTERNATIVE ROUTE
+  // ============================================================
+  void selectAlternativeRoute(int index) {
+    if (!getFeature('alternativeRoutes')) {
+      _logWarning('Alternative routes feature is disabled');
+      return;
+    }
+    if (index < 0 || index > alternativeRoutes.length) return;
+    selectedRouteIndex = index + 1;
+    if (index < alternativeRoutes.length) {
+      final altPoints = alternativeRoutes[index];
+      if (altPoints.isNotEmpty) {
+        currentRoutePoints = altPoints;
+        polylines = _buildPolylinesWithTraffic(altPoints);
+        polylines.addAll(_buildAlternativePolylines(alternativeRoutes));
+        if (index < alternativeDurations.length) {
+          final altDuration = alternativeDurations[index];
+          estimatedMinutes = altDuration.inMinutes > 0 ? altDuration.inMinutes : 1;
+        }
+        onMapUpdated?.call();
+        speak('Switched to alternative route.');
+      }
+    }
+  }
+
+  // ============================================================
+  // TURN-BY-TURN NAVIGATION HELPERS
+  // ============================================================
+  void _speakInstruction(NavigationStep step) {
+    final maneuverText = _getManeuverText(step.maneuver);
+    final roadText = step.roadName.isNotEmpty ? ' on ${step.roadName}' : '';
+    final distanceText = _formatDistance(step.distance);
+    String voiceText;
+    if (step.maneuver == 'straight' || step.maneuver == 'continue') {
+      voiceText = 'Continue$roadText for $distanceText';
+    } else {
+      voiceText = '$maneuverText$roadText, $distanceText';
+    }
+    speak(voiceText);
+    bannerInstruction = step.instruction;
+    bannerManeuver = _getManeuverIcon(step.maneuver);
+    bannerDistance = step.distanceText;
+    bannerNextRoad = step.roadShield.isNotEmpty ? step.roadShield : step.roadName;
+    bannerCurrentRoad = currentStepIndex > 0 ? routeSteps[currentStepIndex - 1].roadName : '';
+    bannerSubInstruction = '${step.durationText} • ${step.roadName.isNotEmpty ? step.roadName : 'Current road'}';
+    bannerProgress = currentStepIndex / (routeSteps.length > 0 ? routeSteps.length : 1);
+    onMapUpdated?.call();
+  }
+
+  void _updateCurrentStepInfo() {
+    if (currentStepIndex < routeSteps.length) {
+      final step = routeSteps[currentStepIndex];
+      laneGuidance = step.lanes;
+      laneGuidanceText = laneGuidance.map((l) => l.displayChar).join(' ');
+      if (step.roadShield.isNotEmpty) {
+        roadShields[step.roadName] = step.roadShield;
+      }
+      nextInstruction = step.instruction;
+      nextManeuver = step.maneuver;
+      nextStepDistance = step.distance;
+      nextRoadHeading = step.startHeading;
+      bannerCurrentRoad = currentStepIndex > 0 ? routeSteps[currentStepIndex - 1].roadName : '';
+      bannerNextRoad = step.roadShield.isNotEmpty ? step.roadShield : step.roadName;
+      bannerInstruction = step.instruction;
+      bannerManeuver = _getManeuverIcon(step.maneuver);
+      bannerDistance = step.distanceText;
+      bannerProgress = currentStepIndex / (routeSteps.length > 0 ? routeSteps.length : 1);
+      onMapUpdated?.call();
+    }
+  }
+
+  void _checkTurnAlerts() {
+    if (hasArrived || _hasArrivedAndSessionEnded) {
+      return;
+    }
+    
+    if (driverLocation == null || routeSteps.isEmpty || currentStepIndex >= routeSteps.length) {
+      return;
+    }
+    
+    final currentStep = routeSteps[currentStepIndex];
+    final distanceToStepEnd = Geolocator.distanceBetween(
+      driverLocation!.latitude,
+      driverLocation!.longitude,
+      currentStep.endLocation.latitude,
+      currentStep.endLocation.longitude,
+    );
+    
+    _updateCurrentRoadHeading();
+    
+    if (currentRoadHeading != null && nextRoadHeading != null && currentStepIndex < routeSteps.length - 1) {
+      final nextStep = routeSteps[currentStepIndex + 1];
+      final nextStepHeading = nextStep.startHeading;
+      double turnAngle = (nextStepHeading - currentRoadHeading!).abs() % 360;
+      if (turnAngle > 180) turnAngle = 360 - turnAngle;
+      if (turnAngle > 30) {
+        final cross = _crossProduct(
+          driverLocation!,
+          _getPointAhead(driverLocation!, currentRoadHeading!, 10),
+          _getPointAhead(currentStep.endLocation, nextStepHeading, 10)
+        );
+        final actualManeuver = cross > 0 ? 'turn-left' : 'turn-right';
+        if (actualManeuver != nextManeuver) {
+          _logInfo('Correcting maneuver: $nextManeuver → $actualManeuver');
+          nextManeuver = actualManeuver;
+        }
+      }
+    }
+    
+    _checkJunctionProximity(distanceToStepEnd, currentStep.roadName, currentStep.maneuver);
+    bannerDistance = _formatDistance(distanceToStepEnd);
+    onMapUpdated?.call();
+    
+    if (!hasArrived && !_hasArrivedAndSessionEnded) {
+      _handleVoiceAnnouncements(distanceToStepEnd, currentStep);
+    }
+    
+    if (distanceToStepEnd < 20 && currentStepIndex < routeSteps.length - 1 && !hasArrived && !_hasArrivedAndSessionEnded) {
+      _completeStep();
+    }
+    
+    if (distanceToStepEnd < 50 && currentStepIndex >= routeSteps.length - 1 && !hasArrived && !_hasArrivedAndSessionEnded) {
+      _handleArrival();
+    }
+  }
+
+  LatLng _getPointAhead(LatLng from, double bearing, double distanceMeters) {
+    const double R = 6371000;
+    final lat = from.latitude * pi / 180;
+    final lng = from.longitude * pi / 180;
+    final brng = bearing * pi / 180;
+    final newLat = asin(sin(lat) * cos(distanceMeters / R) + cos(lat) * sin(distanceMeters / R) * cos(brng));
+    final newLng = lng + atan2(sin(brng) * sin(distanceMeters / R) * cos(lat), cos(distanceMeters / R) - sin(lat) * sin(newLat));
+    return LatLng(newLat * 180 / pi, newLng * 180 / pi);
+  }
+
+  void _updateCurrentRoadHeading() {
+    if (currentRoutePoints.isEmpty || driverLocation == null) return;
+    double minDist = double.infinity;
+    int nearestIndex = 0;
+    for (int i = 0; i < currentRoutePoints.length; i++) {
+      final dist = Geolocator.distanceBetween(
+        driverLocation!.latitude,
+        driverLocation!.longitude,
+        currentRoutePoints[i].latitude,
+        currentRoutePoints[i].longitude,
+      );
+      if (dist < minDist) {
+        minDist = dist;
+        nearestIndex = i;
+      }
+    }
+    if (nearestIndex < currentRoutePoints.length - 1) {
+      currentRoadHeading = _calculateBearing(
+        currentRoutePoints[nearestIndex],
+        currentRoutePoints[min(nearestIndex + 1, currentRoutePoints.length - 1)]
+      );
+    }
+  }
+
+  void _handleVoiceAnnouncements(double distanceToStepEnd, NavigationStep currentStep) {
+    if (hasArrived || _hasArrivedAndSessionEnded) {
+      return;
+    }
+    
+    final bool isTurn = currentStep.maneuver != 'straight' && currentStep.maneuver != 'continue';
+    const List<double> thresholds = [2000, 1000, 500, 200, 100, 50];
+    
+    for (final threshold in thresholds) {
+      if (distanceToStepEnd <= threshold && distanceToStepEnd > threshold - 10 && lastAnnouncementDistance != threshold) {
+        lastAnnouncementDistance = threshold;
+        
+        if (isTurn) {
+          String voiceText;
+          if (threshold == 50) {
+            voiceText = '${_getManeuverText(currentStep.maneuver)} now!';
+          } else if (threshold == 100) {
+            voiceText = 'In 100 meters, ${_getManeuverText(currentStep.maneuver)}';
+          } else if (threshold == 200) {
+            voiceText = 'In 200 meters, ${_getManeuverText(currentStep.maneuver)}';
+          } else {
+            voiceText = 'In ${_formatDistance(threshold.toDouble())}, ${_getManeuverText(currentStep.maneuver)} onto ${currentStep.roadName.isNotEmpty ? currentStep.roadName : "the road"}';
+          }
+          speak(voiceText);
+        } else {
+          if (threshold == 50) {
+            speak('Continue straight');
+          } else if (threshold % 1000 == 0) {
+            speak('Continue for ${threshold ~/ 1000} kilometers');
+          } else {
+            speak('Continue for ${_formatDistance(threshold.toDouble())}');
+          }
+        }
+        
+        String alertText = isTurn ? '${_getManeuverIcon(currentStep.maneuver)} ${_getManeuverText(currentStep.maneuver)} in ${_formatDistance(threshold.toDouble())}' : '⬆ Continue for ${_formatDistance(threshold.toDouble())}';
+        onTurnAlert?.call(alertText, threshold < 100 ? 'danger' : 'info');
+      }
+    }
+  }
+
+  void _completeStep() {
+    if (hasArrived || _hasArrivedAndSessionEnded) {
+      return;
+    }
+    
+    _logInfo('Completing step ${currentStepIndex + 1}/${routeSteps.length}');
+    currentStepIndex++;
+    hasAnnouncedCurrentStep = false;
+    lastAnnouncementDistance = -1;
+    
+    if (currentStepIndex < routeSteps.length) {
+      _updateCurrentStepInfo();
+      final nextStep = routeSteps[currentStepIndex];
+      _speakInstruction(nextStep);
+      hasAnnouncedCurrentStep = true;
+    }
+  }
+
+  // ✅ FIXED: Integrated junction proximity check
+  void _checkJunctionProximity(double distanceToStepEnd, String roadName, String maneuver) {
+    if (!getFeature('junctionOverlay')) {
+      showJunctionOverlay = false;
+      return;
+    }
+    final bool wasNearJunction = isNearJunction;
+    isNearJunction = distanceToStepEnd < 200;
+    junctionDistance = distanceToStepEnd;
+    junctionRoadName = roadName;
+    junctionManeuver = maneuver;
+    showJunctionOverlay = isNearJunction;
+    if (isNearJunction != wasNearJunction && mapController != null && driverLocation != null) {
+      _updateCameraPosition();
+    }
+    onMapUpdated?.call();
+  }
+
+  // ============================================================
+  // VOICE NAVIGATION HELPERS
+  // ============================================================
+  String _getManeuverText(String maneuver) {
+    switch (maneuver) {
+      case 'turn-left':
+        return 'turn left';
+      case 'turn-right':
+        return 'turn right';
+      case 'turn-sharp-left':
+        return 'make a sharp left turn';
+      case 'turn-sharp-right':
+        return 'make a sharp right turn';
+      case 'turn-slight-left':
+        return 'bear left';
+      case 'turn-slight-right':
+        return 'bear right';
+      case 'straight':
+        return 'continue straight';
+      case 'continue':
+        return 'continue';
+      case 'merge':
+        return 'merge';
+      case 'fork-left':
+        return 'stay left at the fork';
+      case 'fork-right':
+        return 'stay right at the fork';
+      case 'roundabout':
+        return 'enter the roundabout';
+      case 'ferry':
+        return 'take the ferry';
+      default:
+        return 'continue';
+    }
+  }
+
+  String _getManeuverIcon(String maneuver) {
+    switch (maneuver) {
+      case 'turn-left':
+        return '⬅️';
+      case 'turn-right':
+        return '➡️';
+      case 'turn-sharp-left':
+        return '↰';
+      case 'turn-sharp-right':
+        return '↱';
+      case 'turn-slight-left':
+        return '◀️';
+      case 'turn-slight-right':
+        return '▶️';
+      case 'straight':
+        return '⬆️';
+      case 'continue':
+        return '⬆️';
+      case 'merge':
+        return '🔀';
+      case 'fork-left':
+        return '⬅️↗️';
+      case 'fork-right':
+        return '➡️↖️';
+      case 'ferry':
+        return '⛴️';
+      case 'roundabout':
+        return '🔄';
+      default:
+        return '⬆️';
+    }
+  }
+
+  String getManeuverIcon(String maneuver) {
+    return _getManeuverIcon(maneuver);
+  }
+
+  String _formatDistance(double distanceInMeters) {
+    if (distanceInMeters < 1000) {
+      return '${distanceInMeters.round()} m';
+    } else {
+      return '${(distanceInMeters / 1000).toStringAsFixed(1)} km';
+    }
+  }
+
+  // ============================================================
+  // OFF-ROUTE DETECTION & RECALCULATION
+  // ============================================================
+  bool isDriverOffRoute(LatLng driverPosition, List<LatLng> routePoints) {
+    if (routePoints.isEmpty) return false;
+    double minDistance = double.infinity;
+    int nearestIndex = 0;
+    for (int i = 0; i < routePoints.length; i++) {
+      final distance = Geolocator.distanceBetween(
+        driverPosition.latitude,
+        driverPosition.longitude,
+        routePoints[i].latitude,
+        routePoints[i].longitude,
+      );
+      if (distance < minDistance) {
+        minDistance = distance;
+        nearestIndex = i;
+      }
+    }
+    bool headingMismatch = false;
+    if (currentRoadHeading != null && nearestIndex < routePoints.length - 1) {
+      final routeHeading = _calculateBearing(
+        routePoints[nearestIndex],
+        routePoints[min(nearestIndex + 1, routePoints.length - 1)]
+      );
+      final headingDiff = (currentRoadHeading! - routeHeading).abs() % 360;
+      if (headingDiff > 90 && headingDiff < 270) {
+        headingMismatch = true;
+      }
+    }
+    return minDistance > routeRecalculationThreshold || headingMismatch;
+  }
+
+  // ============================================================
+  // SMOOTH INTERPOLATION
+  // ============================================================
+  void _handleLocationUpdate(LatLng newPosition, double heading, double speed) {
+    currentSpeed = speed;
+    updateHeading(heading);
+    startInterpolation(newPosition);
+    
+    if (isNavigating && !hasArrived && currentRoutePoints.isNotEmpty && getFeature('progressiveRouteClearing')) {
+      clearRouteProgressively(newPosition);
+    }
+  }
+
+  void startInterpolation(LatLng newPosition) {
+    if (interpolatedDriverPosition == null) {
+      interpolatedDriverPosition = newPosition;
+      previousInterpolatedPosition = newPosition;
+      targetInterpolatedPosition = newPosition;
+      interpolationProgress = 1.0;
+      driverLocation = newPosition;
+      _updateCameraPosition();
+      onMapUpdated?.call();
+      return;
+    }
+    final distance = Geolocator.distanceBetween(
+      interpolatedDriverPosition!.latitude,
+      interpolatedDriverPosition!.longitude,
+      newPosition.latitude,
+      newPosition.longitude,
+    );
+    if (distance < 0.5) {
+      interpolatedDriverPosition = newPosition;
+      previousInterpolatedPosition = newPosition;
+      targetInterpolatedPosition = newPosition;
+      interpolationProgress = 1.0;
+      driverLocation = newPosition;
+      onMapUpdated?.call();
+      return;
+    }
+    previousInterpolatedPosition = interpolatedDriverPosition;
+    targetInterpolatedPosition = newPosition;
+    interpolationProgress = 0.0;
+    interpolationStartTime = DateTime.now();
+    interpolationTimer?.cancel();
+    final controlPoint1 = LatLng(
+      previousInterpolatedPosition!.latitude + (targetInterpolatedPosition!.latitude - previousInterpolatedPosition!.latitude) * 0.25,
+      previousInterpolatedPosition!.longitude + (targetInterpolatedPosition!.longitude - previousInterpolatedPosition!.longitude) * 0.25,
+    );
+    final controlPoint2 = LatLng(
+      previousInterpolatedPosition!.latitude + (targetInterpolatedPosition!.latitude - previousInterpolatedPosition!.latitude) * 0.75,
+      previousInterpolatedPosition!.longitude + (targetInterpolatedPosition!.longitude - previousInterpolatedPosition!.longitude) * 0.75,
+    );
+    interpolationTimer = Timer.periodic(const Duration(milliseconds: 30), (timer) {
+      if (interpolationStartTime == null || previousInterpolatedPosition == null || targetInterpolatedPosition == null) {
+        timer.cancel();
+        return;
+      }
+      final elapsed = DateTime.now().difference(interpolationStartTime!);
+      final progress = (elapsed.inMilliseconds / interpolationDuration.inMilliseconds).clamp(0.0, 1.0);
+      final easedProgress = progress < 0.5 ? 4 * progress * progress * progress : 1 - pow(-2 * progress + 2, 3) / 2;
+      interpolationProgress = easedProgress;
+      final t = easedProgress;
+      final mt = 1 - t;
+      final lat = mt * mt * mt * previousInterpolatedPosition!.latitude +
+          3 * mt * mt * t * controlPoint1.latitude +
+          3 * mt * t * t * controlPoint2.latitude +
+          t * t * t * targetInterpolatedPosition!.latitude;
+      final lng = mt * mt * mt * previousInterpolatedPosition!.longitude +
+          3 * mt * mt * t * controlPoint1.longitude +
+          3 * mt * t * t * controlPoint2.longitude +
+          t * t * t * targetInterpolatedPosition!.longitude;
+      interpolatedDriverPosition = LatLng(lat, lng);
+      driverLocation = LatLng(lat, lng);
+      onMapUpdated?.call();
+      if (progress >= 1.0) {
+        timer.cancel();
+        interpolatedDriverPosition = targetInterpolatedPosition;
+        driverLocation = targetInterpolatedPosition;
+        interpolationProgress = 1.0;
+        onMapUpdated?.call();
+        _updateCameraPosition();
+      }
+    });
+  }
+
+  // ============================================================
+  // PROGRESSIVE ROUTE CLEARING
+  // ============================================================
+  void clearRouteProgressively(LatLng driverPosition) {
+    if (currentRoutePoints.isEmpty || routeSteps.isEmpty) return;
+    if (!getFeature('progressiveRouteClearing')) return;
+    
+    if (isRecalculatingRoute) {
+      _logInfo('Route recalculation in progress, skipping progressive clear');
+      return;
+    }
+    
+    try {
+      double minDistance = double.infinity;
+      int nearestIndex = 0;
+      
+      for (int i = 0; i < currentRoutePoints.length; i++) {
+        final distance = Geolocator.distanceBetween(
+          driverPosition.latitude,
+          driverPosition.longitude,
+          currentRoutePoints[i].latitude,
+          currentRoutePoints[i].longitude,
+        );
+        if (distance < minDistance) {
+          minDistance = distance;
+          nearestIndex = i;
+        }
+      }
+      
+      if (nearestIndex > 10 && nearestIndex < currentRoutePoints.length - 5) {
+        final keepAhead = 20;
+        final startIndex = (nearestIndex - 5).clamp(0, currentRoutePoints.length - 1);
+        
+        if (startIndex > 0) {
+          final remainingPoints = currentRoutePoints.sublist(startIndex);
+          
+          if (remainingPoints.length > 5) {
+            currentRoutePoints = remainingPoints;
+            
+            polylines = _buildPolylinesWithTraffic(currentRoutePoints);
+            polylines.addAll(_buildAlternativePolylines(alternativeRoutes));
+            
+            int stepsToRemove = 0;
+            for (int i = 0; i < routeSteps.length; i++) {
+              final stepEnd = routeSteps[i].endLocation;
+              final distToStepEnd = Geolocator.distanceBetween(
+                driverPosition.latitude,
+                driverPosition.longitude,
+                stepEnd.latitude,
+                stepEnd.longitude,
+              );
+              if (distToStepEnd < 50) {
+                stepsToRemove = i + 1;
+              }
+            }
+            
+            if (stepsToRemove > 0 && stepsToRemove < routeSteps.length) {
+              routeSteps = routeSteps.sublist(stepsToRemove);
+              currentStepIndex = currentStepIndex - stepsToRemove;
+              if (currentStepIndex < 0) currentStepIndex = 0;
+              _updateCurrentStepInfo();
+            }
+            
+            if (routeSteps.isNotEmpty) {
+              bannerProgress = currentStepIndex / routeSteps.length;
+            }
+            
+            onMapUpdated?.call();
+            _logInfo('Route progressively cleared - ${remainingPoints.length} points remaining');
+          }
+        }
+      }
+    } catch (e) {
+      _logError('Error clearing route progressively', details: {'error': e.toString()});
+    }
+  }
+
+  // ============================================================
+  // ROUTE FOLLOWING
+  // ============================================================
+  LatLng _snapToRoute(LatLng position) {
+    if (!useRouteFollowing || currentRoutePoints.isEmpty) {
+      return position;
+    }
+    double minDistance = double.infinity;
+    int nearestIndex = 0;
+    for (int i = 0; i < currentRoutePoints.length; i++) {
+      final distance = Geolocator.distanceBetween(
+        position.latitude,
+        position.longitude,
+        currentRoutePoints[i].latitude,
+        currentRoutePoints[i].longitude,
+      );
+      if (distance < minDistance) {
+        minDistance = distance;
+        nearestIndex = i;
+      }
+    }
+    if (minDistance > routeSnapDistance) {
+      _logInfo('Driver is ${minDistance.toStringAsFixed(0)}m from route - not snapping');
+      return position;
+    }
+    LatLng snappedPoint = currentRoutePoints[nearestIndex];
+    if (nearestIndex == currentRoutePoints.length - 1) {
+      return snappedPoint;
+    }
+    LatLng nextPoint = currentRoutePoints[nearestIndex + 1];
+    double segmentLength = Geolocator.distanceBetween(
+      snappedPoint.latitude,
+      snappedPoint.longitude,
+      nextPoint.latitude,
+      nextPoint.longitude,
+    );
+    if (segmentLength < 0.1) {
+      return snappedPoint;
+    }
+    double latDiff = position.latitude - snappedPoint.latitude;
+    double lngDiff = position.longitude - snappedPoint.longitude;
+    double projectionFactor = (latDiff * (nextPoint.latitude - snappedPoint.latitude) +
+        lngDiff * (nextPoint.longitude - snappedPoint.longitude)) / (segmentLength * segmentLength);
+    projectionFactor = projectionFactor.clamp(0.0, 1.0);
+    LatLng projectedPoint = LatLng(
+      snappedPoint.latitude + projectionFactor * (nextPoint.latitude - snappedPoint.latitude),
+      snappedPoint.longitude + projectionFactor * (nextPoint.longitude - snappedPoint.longitude),
+    );
+    double blendFactor = minDistance < 5 ? 1.0 : minDistance / routeSnapDistance;
+    blendFactor = blendFactor.clamp(0.0, 1.0);
+    return LatLng(
+      projectedPoint.latitude * blendFactor + position.latitude * (1 - blendFactor),
+      projectedPoint.longitude * blendFactor + position.longitude * (1 - blendFactor),
+    );
+  }
+
+  double _getRouteHeading(LatLng position) {
+    if (currentRoutePoints.length < 2) return currentHeading;
+    double minDistance = double.infinity;
+    int nearestIndex = 0;
+    for (int i = 0; i < currentRoutePoints.length; i++) {
+      final distance = Geolocator.distanceBetween(
+        position.latitude,
+        position.longitude,
+        currentRoutePoints[i].latitude,
+        currentRoutePoints[i].longitude,
+      );
+      if (distance < minDistance) {
+        minDistance = distance;
+        nearestIndex = i;
+      }
+    }
+    if (nearestIndex < currentRoutePoints.length - 1) {
+      return _calculateBearing(
+        currentRoutePoints[nearestIndex],
+        currentRoutePoints[nearestIndex + 1]
+      );
+    } else if (nearestIndex > 0) {
+      return _calculateBearing(
+        currentRoutePoints[nearestIndex - 1],
+        currentRoutePoints[nearestIndex]
+      );
+    }
+    return currentHeading;
+  }
+
+  // ============================================================
+  // CAMERA FOLLOWING
+  // ============================================================
+  void startCameraFollowing() {
+    cameraFollowTimer?.cancel();
+    if (driverLocation != null) {
+      cameraTargetPosition = driverLocation;
+      cameraBearing = currentHeading;
+      cameraZoom = baseZoom;
+    }
+    movementCheckTimer?.cancel();
+    movementCheckTimer = Timer.periodic(const Duration(milliseconds: 500), (timer) {
+      _checkDriverMovement();
+    });
+    cameraFollowTimer = Timer.periodic(const Duration(milliseconds: 100), (timer) {
+      _updateCameraIfNeeded();
+    });
+  }
+
+  void _checkDriverMovement() {
+    if (driverLocation == null) return;
+    if (lastKnownPosition == null) {
+      lastKnownPosition = driverLocation;
+      isDriverMoving = false;
+      return;
+    }
+    final distance = Geolocator.distanceBetween(
+      lastKnownPosition!.latitude,
+      lastKnownPosition!.longitude,
+      driverLocation!.latitude,
+      driverLocation!.longitude,
+    );
+    isDriverMoving = distance > movementThreshold;
+    if (isDriverMoving) {
+      lastKnownPosition = driverLocation;
+      _updateCameraPosition();
+    }
+  }
+
+  void _updateCameraIfNeeded() {
+    if (!isCameraFollowing || mapController == null || driverLocation == null) return;
+    if (isDriverMoving || cameraTargetPosition == null) {
+      _updateCameraPosition();
+    }
+  }
+
+  // ✅ FIXED: Complete _updateCameraPosition implementation
+  void _updateCameraPosition() {
+    if (mapController == null || driverLocation == null) return;
+    final targetLat = driverLocation!.latitude;
+    final targetLng = driverLocation!.longitude;
+    if (cameraTargetPosition == null) {
+      cameraTargetPosition = driverLocation;
+    }
+    final deltaLat = targetLat - cameraTargetPosition!.latitude;
+    final deltaLng = targetLng - cameraTargetPosition!.longitude;
+    if (deltaLat.abs() > 0.00001 || deltaLng.abs() > 0.00001) {
+      cameraTargetPosition = LatLng(
+        cameraTargetPosition!.latitude + deltaLat * 0.3,
+        cameraTargetPosition!.longitude + deltaLng * 0.3,
+      );
+    }
+    double targetBearing = isMapRotating ? currentHeading : 0;
+    double bearingDiff = targetBearing - cameraBearing;
+    if (bearingDiff > 180) bearingDiff -= 360;
+    if (bearingDiff < -180) bearingDiff += 360;
+    cameraBearing += bearingDiff * 0.2;
+    double targetZoom = baseZoom;
+    if (isNearJunction) {
+      targetZoom = baseZoom + 0.5;
+    }
+    cameraZoom += (targetZoom - cameraZoom) * 0.1;
+    _updateMapPadding();
+    mapController!.animateCamera(
+      CameraUpdate.newCameraPosition(
+        CameraPosition(
+          target: cameraTargetPosition!,
+          zoom: cameraZoom,
+          bearing: cameraBearing,
+          tilt: 60.0,
+        ),
+      ),
+    );
+  }
+
+  void updateHeading(double heading) {
+    if (headingHistory.isEmpty) {
+      headingHistory.add(heading);
+      currentHeading = heading;
+      previousHeading = heading;
+      return;
+    }
+    double diff = heading - previousHeading;
+    if (diff > 180) diff -= 360;
+    if (diff < -180) diff += 360;
+    const double smoothFactor = 0.12;
+    final smoothDiff = diff * smoothFactor;
+    final newHeading = previousHeading + smoothDiff;
+    previousHeading = newHeading;
+    currentHeading = ((newHeading % 360) + 360) % 360;
+    headingHistory.add(currentHeading);
+    if (headingHistory.length > maxHeadingHistory) {
+      headingHistory.removeAt(0);
+    }
+  }
+
+  // ============================================================
+  // INITIALIZE MAP
+  // ============================================================
+  void initializeMap(GoogleMapController controller) {
+    mapController = controller;
+    if (driverLocation != null) {
+      controller.animateCamera(
+        CameraUpdate.newCameraPosition(
+          CameraPosition(
+            target: driverLocation!,
+            zoom: baseZoom,
+            tilt: 60.0,
+            bearing: currentHeading,
+          ),
+        ),
+      );
+    }
+    isMapRotating = true;
+    isCameraFollowing = true;
+    startCameraFollowing();
+    initializeAnimationUpdates();
+  }
+
+  void fitRouteToBounds() {
+    if (mapController == null || currentRoutePoints.isEmpty) return;
+    List<LatLng> points = List.from(currentRoutePoints);
+    if (customerLocation != null) points.add(customerLocation!);
+    if (driverLocation != null) points.add(driverLocation!);
+    final bounds = getBoundsFromPoints(points);
+    mapController!.animateCamera(
+      CameraUpdate.newLatLngBounds(
+        bounds,
+        60,
+      ),
+    );
+  }
+
+  // ============================================================
+  // TRAFFIC MONITORING
+  // ============================================================
+  void startTrafficMonitoring() {
+    if (!getFeature('trafficMonitoring')) return;
+    trafficUpdateTimer?.cancel();
+    trafficUpdateTimer = Timer.periodic(const Duration(seconds: 30), (timer) {
+      _checkTrafficAndUpdateETA();
+    });
+  }
+
+  Future<void> _checkTrafficAndUpdateETA() async {
+    if (isCheckingTraffic || currentRoutePoints.isEmpty || driverLocation == null || customerLocation == null) return;
+    isCheckingTraffic = true;
+    try {
+      final origin = driverLocation!;
+      final destination = customerLocation!;
+      final result = await getRouteWithDetails(origin, destination, getAlternatives: false);
+      final newDuration = result['duration'] as Duration?;
+      final newPoints = result['points'] as List<LatLng>;
+      if (newDuration != null && actualTravelDuration != null) {
+        final delayInSeconds = newDuration.inSeconds - actualTravelDuration!.inSeconds;
+        Color trafficColor;
+        String trafficLevel;
+        if (delayInSeconds < 60) {
+          trafficColor = Colors.green;
+          trafficLevel = 'LIGHT';
+        } else if (delayInSeconds < 300) {
+          trafficColor = Colors.orange;
+          trafficLevel = 'MODERATE';
+        } else {
+          trafficColor = Colors.red;
+          trafficLevel = 'HEAVY';
+        }
+        currentTrafficColor = trafficColor;
+        currentTrafficData = {'level': trafficLevel, 'delay': delayInSeconds};
+        if (delayInSeconds > 120 && newPoints.isNotEmpty) {
+          _buildTrafficSegments(newPoints, trafficLevel);
+          polylines = _buildTrafficSegmentedRoute(currentRoutePoints, trafficSegments);
+          polylines.addAll(_buildAlternativePolylines(alternativeRoutes));
+          speak('Traffic update: $trafficLevel traffic ahead.');
+        }
+        estimatedMinutes = newDuration.inMinutes > 0 ? newDuration.inMinutes : 1;
+        onMapUpdated?.call();
+      }
+    } catch (e) {
+      _logError('Traffic check error', details: {'error': e.toString()});
+    }
+    isCheckingTraffic = false;
+  }
+
+  void _buildTrafficSegments(List<LatLng> points, String trafficLevel) {
+    trafficSegments.clear();
+    const int segmentSize = 20;
+    for (int i = 0; i < points.length; i += segmentSize) {
+      final end = min(i + segmentSize, points.length);
+      final segmentPoints = points.sublist(i, end);
+      Color color;
+      if (i < points.length * 0.3) {
+        color = Colors.green;
+      } else if (i < points.length * 0.6) {
+        color = trafficLevel == 'HEAVY' ? Colors.red.shade800 : Colors.orange;
+      } else {
+        color = trafficLevel == 'HEAVY' ? Colors.red : Colors.green;
+      }
+      trafficSegments.add({
+        'points': segmentPoints,
+        'color': color,
+        'level': trafficLevel,
+        'startIndex': i,
+        'endIndex': end,
+      });
+    }
+  }
+
+  // ============================================================
+  // SPEED LIMIT MONITORING
+  // ============================================================
+  void startSpeedLimitMonitoring() {
+    if (!getFeature('speedLimitMonitoring')) return;
+    speedLimitTimer?.cancel();
+    speedLimitTimer = Timer.periodic(const Duration(seconds: 3), (timer) {
+      _checkSpeedLimit();
+    });
+  }
+
+  Future<void> _checkSpeedLimit() async {
+    if (driverLocation == null) return;
+    try {
+      final speedLimit = await _getSpeedLimitFromAPI(driverLocation!);
+      currentSpeedLimit = speedLimit;
+      speedLimitDisplay = speedLimit > 0 ? '$speedLimit km/h' : '--';
+      final bool wasSpeeding = isSpeeding;
+      isSpeeding = currentSpeed > speedLimit * 1.1 && speedLimit > 0;
+      if (isSpeeding && !wasSpeeding && speedLimit > 0) {
+        speak('⚠️ Speed limit exceeded. Please slow down to $speedLimit km/h.');
+        onTurnAlert?.call('⚠️ Speed limit: $speedLimit km/h. You are at ${currentSpeed.toStringAsFixed(0)} km/h', 'danger');
+      }
+      onMapUpdated?.call();
+    } catch (e) {
+      _logError('Speed limit check error', details: {'error': e.toString()});
+    }
+  }
+
+  Future<int> _getSpeedLimitFromAPI(LatLng position) async {
+    try {
+      String baseUrl = 'https://roads.googleapis.com/v1/speedLimits?path=${position.latitude},${position.longitude}'
+          '&key=$googleAPIKey';
+      String url = baseUrl;
+      if (useCorsProxy) {
+        url = '$corsProxyUrl$baseUrl';
+      }
+      final response = await http.get(Uri.parse(url));
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+        if (data['speedLimits'] != null && data['speedLimits'].isNotEmpty) {
+          return data['speedLimits'][0]['speedLimit'] as int;
+        }
+      }
+    } catch (e) {
+      _logError('Error getting speed limit', details: {'error': e.toString()});
+    }
+    return _estimateSpeedLimit();
+  }
+
+  int _estimateSpeedLimit() {
+    if (currentSpeed < 10) return 30;
+    if (currentSpeed < 30) return 50;
+    if (currentSpeed < 50) return 80;
+    return 100;
+  }
+
+  // ============================================================
+  // ROAD SNAPPING
+  // ============================================================
+  Future<void> snapToRoad(LatLng position) async {
+    try {
+      recentPositions.add(position);
+      if (recentPositions.length > maxRecentPositions) {
+        recentPositions.removeAt(0);
+      }
+      String path = recentPositions.map((p) => '${p.latitude},${p.longitude}').join('|');
+      String baseUrl = 'https://roads.googleapis.com/v1/snapToRoads?path=$path'
+          '&interpolate=true'
+          '&key=$googleAPIKey';
+      String url = baseUrl;
+      if (useCorsProxy) {
+        url = '$corsProxyUrl$baseUrl';
+      }
+      final response = await http.get(Uri.parse(url));
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+        if (data['snappedPoints'] != null && data['snappedPoints'].isNotEmpty) {
+          final snapped = data['snappedPoints'].last;
+          snappedDriverPosition = LatLng(
+            snapped['location']['latitude'] as double,
+            snapped['location']['longitude'] as double,
+          );
+          if (snappedDriverPosition != null) {
+            driverLocation = snappedDriverPosition;
+            onMapUpdated?.call();
+          }
+        }
+      }
+    } catch (e) {
+      _logError('Road snapping error', details: {'error': e.toString()});
+    }
+  }
+
+  // ============================================================
+  // GPS FILTERING
+  // ============================================================
+  LatLng filterGPSSignal(LatLng newPosition) {
+    if (filteredPosition == null) {
+      filteredPosition = newPosition;
+      return newPosition;
+    }
+    final lat = filteredPosition!.latitude + filterAlpha * (newPosition.latitude - filteredPosition!.latitude);
+    final lng = filteredPosition!.longitude + filterAlpha * (newPosition.longitude - filteredPosition!.longitude);
+    filteredPosition = LatLng(lat, lng);
+    return LatLng(lat, lng);
+  }
+
+  // ============================================================
+  // GET BOUNDS
+  // ============================================================
+  LatLngBounds getBoundsFromPoints(List<LatLng> points) {
+    double minLat = points.first.latitude;
+    double maxLat = points.first.latitude;
+    double minLng = points.first.longitude;
+    double maxLng = points.first.longitude;
+    for (var point in points) {
+      if (point.latitude < minLat) minLat = point.latitude;
+      if (point.latitude > maxLat) maxLat = point.latitude;
+      if (point.longitude < minLng) minLng = point.longitude;
+      if (point.longitude > maxLng) maxLng = point.longitude;
+    }
+    double latPadding = (maxLat - minLat) * 0.1;
+    double lngPadding = (maxLng - minLng) * 0.1;
+    return LatLngBounds(
+      southwest: LatLng(minLat - latPadding, minLng - lngPadding),
+      northeast: LatLng(maxLat + latPadding, maxLng + lngPadding),
+    );
+  }
+
+  // ============================================================
+  // UPDATE DRIVER POSITION - MAIN ENTRY POINT
+  // ============================================================
+  void updateDriverPosition(Position position, String vehicleType, String numberPlate) {
+    final rawPosition = LatLng(position.latitude, position.longitude);
+    final filtered = filterGPSSignal(rawPosition);
+    final speed = position.speed * 3.6;
+    LatLng finalPosition = filtered;
+    if (useRouteFollowing && currentRoutePoints.isNotEmpty) {
+      finalPosition = _snapToRoute(filtered);
+    }
+    if (position.heading != null && position.heading! >= 0) {
+      updateHeading(position.heading!);
+    } else if (currentSpeed > 1.0 && previousInterpolatedPosition != null) {
+      double calculatedHeading;
+      if (useRouteFollowing && currentRoutePoints.isNotEmpty) {
+        calculatedHeading = _getRouteHeading(finalPosition);
+      } else {
+        calculatedHeading = _calculateBearing(
+          previousInterpolatedPosition!,
+          finalPosition
+        );
+      }
+      if (calculatedHeading >= 0) {
+        updateHeading(calculatedHeading);
+      }
+    }
+    _handleLocationUpdate(finalPosition, currentHeading, speed);
+    snapToRoad(finalPosition);
+    recalculateRouteIfNeeded(finalPosition, vehicleType, numberPlate);
+    sendLocationToFirestore(
+      position: finalPosition,
+      heading: currentHeading,
+      speed: speed,
+    );
+    updateDriverMarkerWithInterpolation(vehicleType, numberPlate);
+  }
+
+  // ============================================================
+  // ZOOM TO ROUTE
+  // ============================================================
+  void zoomToRoute() {
+    if (mapController == null || currentRoutePoints.isEmpty) return;
+    mapController!.animateCamera(
+      CameraUpdate.newLatLngBounds(
+        getBoundsFromPoints(currentRoutePoints),
+        50,
+      ),
+    );
+  }
+
+  // ============================================================
+  // GETTER METHODS
+  // ============================================================
+  Map<String, dynamic> getTrafficStatus() {
+    return {
+      'level': currentTrafficData?['level'] ?? 'LIGHT',
+      'delay': currentTrafficData?['delay'] ?? 0,
+      'color': currentTrafficColor,
+      'hasTraffic': currentTrafficData?['delay'] != null && currentTrafficData?['delay'] > 60,
+      'segments': trafficSegments.length,
+    };
+  }
+
+  Map<String, dynamic> getSpeedLimitStatus() {
+    return {
+      'limit': currentSpeedLimit,
+      'display': speedLimitDisplay,
+      'isSpeeding': isSpeeding,
+      'currentSpeed': currentSpeed,
+    };
+  }
+
+  List<LaneInfo> getLaneGuidance() {
+    return laneGuidance;
+  }
+
+  String getLaneGuidanceText() {
+    return laneGuidanceText;
+  }
+
+  Map<String, dynamic> getNavigationBannerData() {
+    return {
+      'show': showNavigationBanner,
+      'instruction': bannerInstruction,
+      'maneuver': bannerManeuver,
+      'distance': bannerDistance,
+      'nextRoad': bannerNextRoad,
+      'currentRoad': bannerCurrentRoad,
+      'subInstruction': bannerSubInstruction,
+      'progress': bannerProgress,
+      'isNavigating': isNavigating,
+      'stepIndex': currentStepIndex,
+      'totalSteps': routeSteps.length,
+    };
+  }
+
+  Map<String, dynamic> getJunctionData() {
+    return {
+      'isNear': isNearJunction,
+      'roadName': junctionRoadName,
+      'maneuver': junctionManeuver,
+      'distance': _formatDistance(junctionDistance),
+      'showOverlay': showJunctionOverlay,
+    };
+  }
+
+  List<Map<String, dynamic>> getAlternativeRoutesInfo() {
+    final result = <Map<String, dynamic>>[];
+    for (int i = 0; i < alternativeRoutes.length; i++) {
+      final duration = i < alternativeDurations.length ? alternativeDurations[i] : Duration.zero;
+      result.add({
+        'index': i,
+        'duration': duration,
+        'durationText': '${duration.inMinutes} min',
+        'isSelected': selectedRouteIndex == i + 1,
+        'points': alternativeRoutes[i],
+      });
+    }
+    return result;
+  }
+
+  EdgeInsets getMapPadding() {
+    return mapPadding;
+  }
+
+  void setMapPadding(EdgeInsets padding) {
+    mapPadding = padding;
+  }
+
+  void setVoiceEnabled(bool enabled) {
+    isVoiceEnabled = enabled;
+  }
+
+  void setPredictiveCameraEnabled(bool enabled) {
+    predictiveCameraEnabled = enabled;
+  }
+
+  void setFilterAlpha(double alpha) {
+    filterAlpha = alpha.clamp(0.0, 1.0);
+  }
+
+  LatLng? getFilteredPosition() {
+    return filteredPosition;
+  }
+
+  LatLng? getPredictedCameraTarget() {
+    return predictedCameraTarget;
+  }
+
+  double getCurrentZoom() {
+    return currentZoom;
+  }
+
+  String getArrivalTime() {
+    if (estimatedMinutes == null) return 'Now';
+    final arrival = DateTime.now().add(Duration(minutes: estimatedMinutes!));
+    final period = arrival.hour >= 12 ? 'PM' : 'AM';
+    final hour = arrival.hour > 12 ? arrival.hour - 12 : arrival.hour;
+    return '${hour}:${arrival.minute.toString().padLeft(2, '0')} $period';
+  }
+
+  double getHeading() {
+    return currentHeading;
+  }
+
+  void setMapRotation(bool enabled) {
+    isMapRotating = enabled;
+  }
+
+  bool isMoving() {
+    return isDriverMoving;
+  }
+
+  void setRouteFollowing(bool enabled) {
+    useRouteFollowing = enabled;
+    _logInfo('Route following ${enabled ? 'enabled' : 'disabled'}');
+  }
+
+  void setRouteSnapDistance(double meters) {
+    routeSnapDistance = meters.clamp(5.0, 100.0);
+    _logInfo('Route snap distance set to ${routeSnapDistance.toStringAsFixed(0)}m');
+  }
+
+  void setCarSize(double width, double height) {
+    carWidth = width.clamp(30.0, 200.0);
+    carHeight = height.clamp(30.0, 200.0);
+    markerCache.clear();
+    _logInfo('Driver car size set to ${carWidth.toStringAsFixed(0)}x${carHeight.toStringAsFixed(0)}');
+    if (driverLocation != null) {
+      _forceMarkerUpdate();
+    }
+  }
+
+  Map<String, double> getCarSize() {
+    return {
+      'width': carWidth,
+      'height': carHeight,
+    };
+  }
+
+  void _forceMarkerUpdate() {
+    if (_currentVehicleType != null && _currentNumberPlate != null && driverLocation != null) {
+      _getVehicleMarker(_currentVehicleType!.toLowerCase(), bearing: currentHeading).then((markerIcon) {
+        mapMarkers.removeWhere((marker) => marker.markerId.value == 'driver');
+        mapMarkers.add(
+          Marker(
+            markerId: const MarkerId('driver'),
+            position: driverLocation!,
+            icon: markerIcon,
+            rotation: currentHeading,
+            anchor: const Offset(0.5, 0.9),
+            flat: true,
+            infoWindow: InfoWindow(
+              title: '🚗 Your Location',
+              snippet: '$_currentVehicleType • $_currentNumberPlate • ${currentSpeed.toStringAsFixed(0)} km/h',
+            ),
+          ),
+        );
+        if (driverId != null) {
+          bool isMoving = currentSpeed > 2.0;
+          updateAnimatedDriver(
+            driverId: driverId!,
+            position: driverLocation!,
+            heading: currentHeading,
+            speed: currentSpeed,
+            vehicleType: _currentVehicleType!,
+            numberPlate: _currentNumberPlate!,
+            isMoving: isMoving,
+          );
+        }
+        onMapUpdated?.call();
+      });
+    } else {
+      onMapUpdated?.call();
+    }
+  }
+
+  Map<String, dynamic> getCorsConfig() {
+    return {
+      'useProxy': useCorsProxy,
+      'proxyUrl': corsProxyUrl,
+      'isWeb': const bool.fromEnvironment('dart.library.js_util'),
+    };
+  }
+
+  void toggleCorsProxy(bool enabled) {
+    _logWarning('CORS proxy toggle requires app restart to take effect');
+    _logInfo('Set useCorsProxy = $enabled in the code and rebuild');
+  }
+
+  // ============================================================
+  // ANIMATED DRIVER METHODS
+  // ============================================================
+  void initializeAnimationUpdates() {
+    if (!getFeature('animatedMarkers')) return;
+    _animationUpdateTimer?.cancel();
+    _animationUpdateTimer = Timer.periodic(const Duration(milliseconds: 100), (timer) {
+      _updateAnimatedMarkers();
+    });
+  }
+
+  void _updateAnimatedMarkers() {
+    if (_animatedDrivers.isEmpty) {
+      animatedMarkers.clear();
+      onMapUpdated?.call();
+      return;
+    }
+    animatedMarkers.clear();
+    _animatedDrivers.forEach((id, data) {
+      _getVehicleMarker(data.vehicleType.toLowerCase(), bearing: data.bearing).then((markerIcon) {
+        animatedMarkers.add(
+          Marker(
+            markerId: MarkerId('animated_$id'),
+            position: data.path.last,
+            icon: markerIcon,
+            rotation: data.bearing,
+            anchor: const Offset(0.5, 0.9),
+            flat: true,
+            infoWindow: InfoWindow(
+              title: '🚗 Driver $id',
+              snippet: '${data.vehicleType} • ${data.numberPlate} • ${data.speed.toStringAsFixed(0)} km/h',
+            ),
+          ),
+        );
+        onMapUpdated?.call();
+      });
+    });
+  }
+
+  void updateAnimatedDriver({
+    required String driverId,
+    required LatLng position,
+    required double heading,
+    required double speed,
+    required String vehicleType,
+    required String numberPlate,
+    bool isMoving = true,
+  }) {
+    if (!_driverPaths.containsKey(driverId)) {
+      _driverPaths[driverId] = [];
+    }
+    _driverPaths[driverId]!.add(position);
+    if (_driverPaths[driverId]!.length > 100) {
+      _driverPaths[driverId]!.removeAt(0);
+    }
+    _animatedDrivers[driverId] = AnimatedDriverData(
+      id: driverId,
+      vehicleType: vehicleType,
+      numberPlate: numberPlate,
+      path: _driverPaths[driverId]!,
+      bearing: heading,
+      speed: speed,
+      isMoving: isMoving,
+    );
+    if (!isMoving) {
+      _addStaticDriver(driverId, position, vehicleType, numberPlate, heading);
+      _animatedDrivers.remove(driverId);
+    }
+    _updateAnimatedMarkers();
+  }
+
+  void _addStaticDriver(String driverId, LatLng position, String vehicleType, String numberPlate, double heading) {
+    _getVehicleMarker(vehicleType.toLowerCase(), bearing: heading).then((markerIcon) {
+      mapMarkers.removeWhere((marker) => marker.markerId.value == 'static_$driverId');
+      mapMarkers.add(
+        Marker(
+          markerId: MarkerId('static_$driverId'),
+          position: position,
+          icon: markerIcon,
+          rotation: heading,
+          anchor: const Offset(0.5, 0.9),
+          flat: true,
+          infoWindow: InfoWindow(
+            title: '🚗 Driver $driverId (Idle)',
+            snippet: '$vehicleType • $numberPlate',
+          ),
+        ),
+      );
+      onMapUpdated?.call();
+    });
+  }
+
+  void removeAnimatedDriver(String driverId) {
+    _animatedDrivers.remove(driverId);
+    _driverPaths.remove(driverId);
+    mapMarkers.removeWhere((marker) => marker.markerId.value == 'static_$driverId');
+    _updateAnimatedMarkers();
+  }
+
+  Set<Marker> getAnimatedMarkers() {
+    return animatedMarkers;
+  }
+
+  Set<Marker> getStaticMarkers() {
+    return mapMarkers;
+  }
+
+  Map<String, dynamic> getAnimationSettings() {
+    return {
+      'duration': animarkerDuration,
+      'curve': animarkerCurve,
+      'useRotation': animarkerUseRotation,
+    };
+  }
+
+  void setAnimationSettings({
+    Duration? duration,
+    Curve? curve,
+    bool? useRotation,
+  }) {
+    if (duration != null) animarkerDuration = duration;
+    if (curve != null) animarkerCurve = curve;
+    if (useRotation != null) animarkerUseRotation = useRotation;
+  }
+
+  List<AnimatedDriverData> getAnimatedDrivers() {
+    return _animatedDrivers.values.toList();
+  }
+
+  List<LatLng> getDriverPath(String driverId) {
+    return _driverPaths[driverId] ?? [];
+  }
+
+  // ============================================================
+  // MAP STYLE FOR LARGER FONTS
+  // ============================================================
+  String getMapStyle() {
+    return '''
+[
+  {
+    "featureType": "all",
+    "elementType": "labels.text",
+    "stylers": [
+      { "visibility": "on" },
+      { "size": "large" }
+    ]
+  },
+  {
+    "featureType": "road",
+    "elementType": "labels.text",
+    "stylers": [
+      { "visibility": "on" },
+      { "size": "large" }
+    ]
+  },
+  {
+    "featureType": "water",
+    "elementType": "labels.text",
+    "stylers": [
+      { "visibility": "on" },
+      { "size": "large" }
+    ]
+  },
+  {
+    "featureType": "landscape",
+    "elementType": "labels.text",
+    "stylers": [
+      { "visibility": "on" },
+      { "size": "large" }
+    ]
+  },
+  {
+    "featureType": "poi",
+    "elementType": "labels.text",
+    "stylers": [
+      { "visibility": "on" },
+      { "size": "large" }
+    ]
+  },
+  {
+    "featureType": "transit",
+    "elementType": "labels.text",
+    "stylers": [
+      { "visibility": "on" },
+      { "size": "large" }
+    ]
+  },
+  {
+    "featureType": "administrative",
+    "elementType": "labels.text",
+    "stylers": [
+      { "visibility": "on" },
+      { "size": "large" }
+    ]
+  },
+  {
+    "featureType": "administrative.neighborhood",
+    "elementType": "labels.text",
+    "stylers": [
+      { "visibility": "on" },
+      { "size": "large" }
+    ]
+  }
+]
+''';
+  }
+
+  // ============================================================
+  // DISPOSE - Comprehensive cleanup
+  // ============================================================
+  void dispose() {
+    _logInfo('Disposing DriverMapController...');
+    
+    _sessionUpdateTimer?.cancel();
+    _sessionUpdateTimer = null;
+    movementCheckTimer?.cancel();
+    movementCheckTimer = null;
+    interpolationTimer?.cancel();
+    interpolationTimer = null;
+    routeRecalculationTimer?.cancel();
+    routeRecalculationTimer = null;
+    turnAlertTimer?.cancel();
+    turnAlertTimer = null;
+    cameraFollowTimer?.cancel();
+    cameraFollowTimer = null;
+    trafficUpdateTimer?.cancel();
+    trafficUpdateTimer = null;
+    speedLimitTimer?.cancel();
+    speedLimitTimer = null;
+    snappingTimer?.cancel();
+    snappingTimer = null;
+    arrivalAnimationTimer?.cancel();
+    arrivalAnimationTimer = null;
+    voiceDebounceTimer?.cancel();
+    voiceDebounceTimer = null;
+    voiceAnnouncementTimer?.cancel();
+    voiceAnnouncementTimer = null;
+    headingSmoothingTimer?.cancel();
+    headingSmoothingTimer = null;
+    zoomSmoothingTimer?.cancel();
+    zoomSmoothingTimer = null;
+    firestoreDebounceTimer?.cancel();
+    firestoreDebounceTimer = null;
+    _animationUpdateTimer?.cancel();
+    _animationUpdateTimer = null;
+    
+    // ✅ Cancel arrival listener on dispose
+    _arrivalCheckTimer?.cancel();
+    _arrivalCheckTimer = null;
+
+    _sessionSubscription?.cancel();
+    _sessionSubscription = null;
+
+    if (_isSessionActive) {
+      try {
+        endNavigationSession(cancelled: true);
+      } catch (e) {
+        _logError('Error ending session during dispose', details: {'error': e.toString()});
+      }
+    }
+
+    onMapUpdated = null;
+    onTurnAlert = null;
+    speakCallback = null;
+    onSessionStarted = null;
+    onSessionCompleted = null;
+    onSessionCancelled = null;
+    onSessionError = null;
+    onSessionUpdate = null;
+    onErrorLogged = null;
+
+    try {
+      disableWakeLock();
+    } catch (e) {
+      // Ignore
+    }
+
+    try {
+      _tts?.stop();
+      _tts = null;
+    } catch (e) {
+      // Ignore
+    }
+
+    mapMarkers.clear();
+    animatedMarkers.clear();
+    polylines.clear();
+    currentRoutePoints.clear();
+    routeSteps.clear();
+    alternativeRoutes.clear();
+    alternativeDurations.clear();
+    recentPositions.clear();
+    markerCache.clear();
+    roadShields.clear();
+    laneGuidance.clear();
+    trafficSegments.clear();
+    headingHistory.clear();
+    announcementQueue.clear();
+    _animatedDrivers.clear();
+    _driverPaths.clear();
+    _staticDrivers.clear();
+    _performanceTimers.clear();
+    _performanceMetrics.clear();
+    _errorLogs.clear();
+
+    _isSessionActive = false;
+    _navigationInitialized = false;
+    _hasAnnouncedStartingNavigation = false;
+    _hasArrivedAndSessionEnded = false;
+    _isInitializingNavigation = false;
+    isNavigating = false;
+    hasArrived = false;
+    isRecalculatingRoute = false;
+
+    try {
+      mapController?.dispose();
+    } catch (e) {
+      // Ignore
+    }
+    mapController = null;
+
+    _logInfo('🗺️ DriverMapController disposed successfully');
+  }
+}

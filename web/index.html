@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base href="$FLUTTER_BASE_HREF">
+
+  <meta charset="UTF-8">
+  <meta content="IE=Edge" http-equiv="X-UA-Compatible">
+  <meta name="description" content="E-Fuel Delivery">
+
+  <title>E-Fuel Delivery</title>
+
+  <!-- ✅ Google Maps JavaScript API with YOUR NEW API KEY -->
+  <script
+    src="https://maps.googleapis.com/maps/api/js?key=AIzaSyATIUosv_VCeiVsQ3q6_LSQhZkrHr0E79o&libraries=places,geometry,drawing&callback=initMap"
+    async
+    defer>
+  </script>
+
+  <script>
+    function initMap() {
+      console.log("✅ Google Maps loaded successfully");
+    }
+
+    // Geolocation for user location
+    if (navigator.geolocation) {
+      navigator.geolocation.getCurrentPosition(
+        (position) => {
+          console.log(
+            "📍 Location granted:",
+            position.coords.latitude,
+            position.coords.longitude
+          );
+        },
+        (error) => {
+          console.warn("⚠️ Location denied:", error.message);
+        }
+      );
+    }
+
+    // Handle Google Maps errors
+    window.onerror = function(message, source, lineno, colno, error) {
+      if (message.includes('Google Maps') || message.includes('maps.googleapis')) {
+        console.warn('⚠️ Google Maps error:', message);
+      }
+      return false;
+    };
+  </script>
+
+  <link rel="manifest" href="manifest.json">
+</head>
+
+<body>
+  <script src="flutter_bootstrap.js" async></script>
+</body>
+</html>

@@ -1,0 +1,64 @@
+name: e_gass
+description: E-Fuel Delivery App
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_tts: ^3.6.0
+  wakelock_plus: ^1.2.8
+  
+  # Firebase
+  firebase_core: ^4.10.0
+  firebase_auth: ^6.5.2
+  cloud_firestore: ^6.5.0
+  firebase_storage: ^13.4.3
+  image_picker: ^1.0.0   # For picking images from gallery
+  
+  # Maps & Location
+  google_maps_flutter: ^2.8.0
+  geolocator: ^14.0.2
+  
+  # HTTP & Networking
+  http: ^1.1.0
+  
+  # URL Launcher (for phone calls)
+  url_launcher: ^6.2.0
+  
+  # State Management
+  provider: ^6.0.5
+  
+  # UI & Utilities
+  cupertino_icons: ^1.0.8
+  flutter_dotenv: ^5.2.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
+  flutter_launcher_icons: ^0.14.4
+
+flutter:
+  uses-material-design: true
+  
+  assets:
+    - assets/car3.png
+    - assets/petrol.jpg
+    - assets/diesel.jpg
+    - assets/kerosin.jpg
+    - assets/vpower.jpg
+    - assets/icon.png
+
+flutter_launcher_icons:
+  android: true
+  ios: true
+  image_path: "assets/icon.png"
+  adaptive_icon_background: "#FFFFFF"
+  adaptive_icon_foreground: "assets/icon.png"
+  min_sdk_android: 21
+  adaptive_icon_padding: 2
+  background_color_ios: "#FFFFFF"
