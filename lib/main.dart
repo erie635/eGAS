@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'firebase_options.dart';
 import 'features/home/home_map_page.dart';
 import 'features/driver/driver_login_page.dart';
@@ -62,6 +63,20 @@ class MyApp extends StatelessWidget {
 
 class HomePage extends StatelessWidget {
   const HomePage({super.key});
+
+  // ✅ Check if user is a driver by checking Firestore
+  Future<bool> _isDriver(User user) async {
+    try {
+      final driverDoc = await FirebaseFirestore.instance
+          .collection('drivers')
+          .doc(user.uid)
+          .get();
+      return driverDoc.exists;
+    } catch (e) {
+      print('Error checking driver status: $e');
+      return false;
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -131,132 +146,198 @@ class HomePage extends StatelessWidget {
             ),
         ],
       ),
-      body: Container(
-        width: double.infinity,
-        padding: const EdgeInsets.all(20),
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            const Icon(
-              Icons.local_gas_station,
-              size: 80,
-              color: Colors.green,
-            ),
-            const SizedBox(height: 20),
-            const Text(
-              'Fuel Delivery Service',
-              style: TextStyle(
-                fontSize: 24,
-                fontWeight: FontWeight.bold,
-              ),
-            ),
-            const SizedBox(height: 8),
-            const Text(
-              'Order fuel or become a driver',
-              style: TextStyle(
-                fontSize: 16,
-                color: Colors.grey,
-              ),
-            ),
-            const SizedBox(height: 40),
+      body: FutureBuilder<bool>(
+        future: user != null ? _isDriver(user) : Future.value(false),
+        builder: (context, snapshot) {
+          // Handle loading state
+          if (snapshot.connectionState == ConnectionState.waiting) {
+            return const Center(
+              child: CircularProgressIndicator(),
+            );
+          }
 
-            // 👤 Customer button
-            SizedBox(
-              width: double.infinity,
-              child: ElevatedButton.icon(
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: Colors.green,
-                  padding: const EdgeInsets.symmetric(vertical: 16),
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(12),
-                  ),
+          final isDriver = snapshot.data ?? false;
+          final isCustomer = user != null && !isDriver;
+
+          return Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(20),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                const Icon(
+                  Icons.local_gas_station,
+                  size: 80,
+                  color: Colors.green,
                 ),
-                onPressed: () {
-                  if (user != null) {
-                    Navigator.push(
-                      context,
-                      MaterialPageRoute(
-                        builder: (_) => const HomeMapPage(),
-                      ),
-                    );
-                  } else {
-                    Navigator.push(
-                      context,
-                      MaterialPageRoute(
-                        builder: (_) => const CustomerLoginPage(),
-                      ),
-                    );
-                  }
-                },
-                icon: const Icon(Icons.person, color: Colors.white),
-                label: Text(
-                  user != null ? 'Order Fuel' : 'Continue as Customer',
-                  style: const TextStyle(
-                    fontSize: 16,
+                const SizedBox(height: 20),
+                const Text(
+                  'Fuel Delivery Service',
+                  style: TextStyle(
+                    fontSize: 24,
                     fontWeight: FontWeight.bold,
-                    color: Colors.white,
                   ),
                 ),
-              ),
-            ),
-
-            const SizedBox(height: 16),
-
-            // 🚚 Driver Mode - Simple clickable word
-            GestureDetector(
-              onTap: () {
-                Navigator.push(
-                  context,
-                  MaterialPageRoute(
-                    builder: (_) => const DriverLoginPage(),
-                  ),
-                );
-              },
-              child: const Padding(
-                padding: EdgeInsets.symmetric(vertical: 8.0),
-                child: Text(
-                  'Driver Mode',
+                const SizedBox(height: 8),
+                const Text(
+                  'Order fuel or become a driver',
                   style: TextStyle(
                     fontSize: 16,
-                    fontWeight: FontWeight.w600,
-                    color: Colors.orange,
+                    color: Colors.grey,
                   ),
                 ),
-              ),
-            ),
+                const SizedBox(height: 40),
 
-            // ✅ PROFILE BUTTON AT BOTTOM
-            if (user != null) ...[
-              const SizedBox(height: 30),
-              const Divider(),
-              const SizedBox(height: 10),
-              Text(
-                'Logged in as: ${user.email}',
-                style: TextStyle(
-                  fontSize: 12,
-                  color: Colors.grey.shade600,
-                ),
-              ),
-              TextButton(
-                onPressed: () {
-                  Navigator.push(
-                    context,
-                    MaterialPageRoute(
-                      builder: (_) => const CustomerDashboard(),
+                // 👤 CUSTOMER MODE
+                SizedBox(
+                  width: double.infinity,
+                  child: ElevatedButton.icon(
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor:
+                          isDriver ? Colors.grey.shade400 : Colors.green,
+                      padding: const EdgeInsets.symmetric(vertical: 16),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(12),
+                      ),
                     ),
-                  );
-                },
-                child: const Text(
-                  'View My Profile',
-                  style: TextStyle(
-                    color: Colors.green,
-                    fontWeight: FontWeight.w600,
+                    onPressed: isDriver
+                        ? null
+                        : () {
+                            if (user != null) {
+                              Navigator.push(
+                                context,
+                                MaterialPageRoute(
+                                  builder: (_) => const HomeMapPage(),
+                                ),
+                              );
+                            } else {
+                              Navigator.push(
+                                context,
+                                MaterialPageRoute(
+                                  builder: (_) => const CustomerLoginPage(),
+                                ),
+                              );
+                            }
+                          },
+                    icon: Icon(
+                      Icons.person,
+                      color: isDriver ? Colors.grey.shade600 : Colors.white,
+                    ),
+                    label: Text(
+                      isDriver
+                          ? 'Customer Mode Unavailable'
+                          : user != null
+                              ? 'Order Fuel'
+                              : 'Continue as Customer',
+                      style: TextStyle(
+                        fontSize: 16,
+                        fontWeight: FontWeight.bold,
+                        color: isDriver ? Colors.grey.shade700 : Colors.white,
+                      ),
+                    ),
                   ),
                 ),
-              ),
-            ],
-          ],
-        ),
+
+                const SizedBox(height: 16),
+
+                //  DRIVER MODE - Simple clickable word
+                GestureDetector(
+                  onTap: isCustomer
+                      ? null
+                      : () {
+                          Navigator.push(
+                            context,
+                            MaterialPageRoute(
+                              builder: (_) => const DriverLoginPage(),
+                            ),
+                          );
+                        },
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 8.0),
+                    child: Text(
+                      isCustomer
+                          ? 'Driver Mode Unavailable'
+                          : user != null && isDriver
+                              ? ' Driver Mode Active'
+                              : 'Driver Mode',
+                      style: TextStyle(
+                        fontSize: 16,
+                        fontWeight: FontWeight.w600,
+                        color: isCustomer
+                            ? Colors.grey.shade400
+                            : user != null && isDriver
+                                ? Colors.green
+                                : Colors.orange,
+                      ),
+                    ),
+                  ),
+                ),
+
+                // ✅ PROFILE BUTTON AT BOTTOM - Only for customers
+                if (user != null && !isDriver) ...[
+                  const SizedBox(height: 30),
+                  const Divider(),
+                  const SizedBox(height: 10),
+                  Text(
+                    'You are logged in as: ${user.email}',
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: Colors.grey.shade600,
+                    ),
+                  ),
+                  TextButton(
+                    onPressed: () {
+                      Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                          builder: (_) => const CustomerDashboard(),
+                        ),
+                      );
+                    },
+                    child: const Text(
+                      'View My Profile',
+                      style: TextStyle(
+                        color: Colors.green,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                ],
+
+                // ✅ DRIVER STATUS - Show when driver is logged in
+                if (user != null && isDriver) ...[
+                  const SizedBox(height: 30),
+                  const Divider(),
+                  const SizedBox(height: 10),
+                  Text(
+                    'You are logged in as: ${user.email}',
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: Colors.grey.shade600,
+                    ),
+                  ),
+                  Container(
+                    margin: const EdgeInsets.only(top: 8),
+                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                    decoration: BoxDecoration(
+                      color: Colors.green.shade50,
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(color: Colors.green.shade200),
+                    ),
+                    child: const Text(
+                      'Driver mode is active',
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: Colors.green,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          );
+        },
       ),
     );
   }

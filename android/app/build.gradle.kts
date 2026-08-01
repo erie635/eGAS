@@ -31,13 +31,16 @@ android {
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+        
+        // ✅ ADDED: MultiDex support
+        multiDexEnabled = true
     }
 
     kotlin {
-    compilerOptions {
-        jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17
+        compilerOptions {
+            jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17
+        }
     }
-}
 
     buildTypes {
         release {
@@ -46,6 +49,11 @@ android {
             signingConfig = signingConfigs.getByName("debug")
         }
     }
+}
+
+// ✅ ADDED: Dependencies section
+dependencies {
+    implementation("androidx.multidex:multidex:2.0.1")
 }
 
 flutter {

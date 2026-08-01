@@ -9,6 +9,8 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
+  
+  # TTS & Wake Lock
   flutter_tts: ^3.6.0
   wakelock_plus: ^1.2.8
   
@@ -17,7 +19,7 @@ dependencies:
   firebase_auth: ^6.5.2
   cloud_firestore: ^6.5.0
   firebase_storage: ^13.4.3
-  image_picker: ^1.0.0   # For picking images from gallery
+  image_picker: ^1.0.0
   
   # Maps & Location
   google_maps_flutter: ^2.8.0
@@ -31,6 +33,15 @@ dependencies:
   
   # State Management
   provider: ^6.0.5
+  
+  # Device Info & UUID
+  device_info_plus: ^10.1.0
+  uuid: ^4.4.0
+  
+  # ============================================================
+  # ADDED: Shared Preferences for session persistence
+  # ============================================================
+  shared_preferences: ^2.2.2
   
   # UI & Utilities
   cupertino_icons: ^1.0.8

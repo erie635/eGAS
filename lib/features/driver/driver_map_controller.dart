@@ -1,6 +1,6 @@
 // ============================================================
 // FILE: lib/features/driver/driver_map_controller.dart
-// COMPLETE: ALL ORIGINAL LOGIC + ENHANCEMENTS + FIXES + ARRIVAL LISTENER
+// COMPLETE - UPDATED WITH ENHANCED ZOOM LOGIC
 // ============================================================
 
 import 'dart:async';
@@ -22,8 +22,6 @@ import '../../services/discount_service.dart';
 // CONSTANTS
 // ============================================================
 const String googleAPIKey = 'AIzaSyATIUosv_VCeiVsQ3q6_LSQhZkrHr0E79o';
-const bool useCorsProxy = true;
-const String corsProxyUrl = 'https://cors-anywhere.herokuapp.com/';
 
 // ============================================================
 // NAVIGATION SESSION STATE
@@ -126,7 +124,7 @@ class AnimatedDriverData {
 }
 
 // ============================================================
-// ✅ ENHANCED: Error Log Entry
+// ENHANCED: Error Log Entry
 // ============================================================
 class ErrorLogEntry {
   final String message;
@@ -150,7 +148,227 @@ class ErrorLogEntry {
 }
 
 // ============================================================
-// ✅ ENHANCED: DRIVER MAP CONTROLLER
+// OPTIMIZATION: Firestore Batch Manager - FIXED
+// ============================================================
+class FirestoreBatchManager {
+  final List<Map<String, dynamic>> _batch = [];
+  Timer? _batchTimer;
+  final FirebaseFirestore _firestore = FirebaseFirestore.instance;
+  final Duration _batchInterval;
+  
+  FirestoreBatchManager({Duration batchInterval = const Duration(seconds: 3)}) 
+      : _batchInterval = batchInterval;
+  
+  void addUpdate(String path, Map<String, dynamic> data) {
+    _batch.add({'path': path, 'data': Map<String, dynamic>.from(data)});
+    _scheduleBatch();
+  }
+  
+  void _scheduleBatch() {
+    _batchTimer?.cancel();
+    _batchTimer = Timer(_batchInterval, () async {
+      await _flushBatch();
+    });
+  }
+  
+  Future<void> _flushBatch() async {
+    if (_batch.isEmpty) return;
+    
+    try {
+      final batch = _firestore.batch();
+      for (var item in _batch) {
+        final ref = _firestore.doc(item['path']);
+        batch.update(ref, item['data']);
+      }
+      await batch.commit();
+      _batch.clear();
+    } catch (e) {
+      // Keep items for retry
+      print('⚠️ Batch update failed, will retry: $e');
+    }
+  }
+  
+  Future<void> flush() async {
+    _batchTimer?.cancel();
+    await _flushBatch();
+  }
+  
+  void dispose() {
+    _batchTimer?.cancel();
+    _batch.clear();
+  }
+}
+
+// ============================================================
+// OPTIMIZATION: Marker Pool
+// ============================================================
+class MarkerPool {
+  static const int MAX_CACHED_MARKERS = 20;
+  final Map<String, Marker> _pool = {};
+  final List<String> _lru = [];
+  
+  Marker getOrCreate(String id, Marker Function() create) {
+    if (_pool.containsKey(id)) {
+      _lru.remove(id);
+      _lru.add(id);
+      return _pool[id]!;
+    }
+    
+    final marker = create();
+    if (_lru.length >= MAX_CACHED_MARKERS) {
+      final oldest = _lru.removeAt(0);
+      _pool.remove(oldest);
+    }
+    _pool[id] = marker;
+    _lru.add(id);
+    return marker;
+  }
+  
+  void clear() {
+    _pool.clear();
+    _lru.clear();
+  }
+  
+  int get size => _pool.length;
+}
+
+// ============================================================
+// OPTIMIZATION: Camera Update Throttler
+// ============================================================
+class CameraUpdateThrottler {
+  Timer? _timer;
+  CameraPosition? _pendingPosition;
+  final GoogleMapController controller;
+  final Duration throttleInterval;
+  bool _isDisposed = false;
+  
+  CameraUpdateThrottler(this.controller, {this.throttleInterval = const Duration(milliseconds: 100)});
+  
+  void updatePosition(CameraPosition position) {
+    if (_isDisposed) return;
+    _pendingPosition = position;
+    _timer ??= Timer.periodic(throttleInterval, (_) {
+      if (!_isDisposed && _pendingPosition != null) {
+        try {
+          controller.animateCamera(CameraUpdate.newCameraPosition(_pendingPosition!));
+        } catch (e) {
+          // Ignore - controller may be disposed
+        }
+        _pendingPosition = null;
+      }
+    });
+  }
+  
+  void dispose() {
+    _isDisposed = true;
+    _timer?.cancel();
+    _timer = null;
+    _pendingPosition = null;
+  }
+}
+
+// ============================================================
+// OPTIMIZATION: Lazy Step Loader - FIXED
+// ============================================================
+class LazyStepLoader {
+  final List<NavigationStep> _steps;
+  final Map<int, NavigationStep> _cache = {};
+  final int _pageSize;
+  
+  LazyStepLoader(this._steps, {int pageSize = 5}) 
+      : _pageSize = pageSize;
+  
+  NavigationStep? getStep(int index) {
+    if (index >= _steps.length) return null;
+    
+    if (!_cache.containsKey(index)) {
+      // Load surrounding steps in batch
+      final start = max(0, index - 2);
+      final end = min(_steps.length, index + 3);
+      for (int i = start; i < end; i++) {
+        if (!_cache.containsKey(i)) {
+          _cache[i] = _steps[i];
+        }
+      }
+      
+      // Clear old cache
+      if (_cache.length > _pageSize * 3) {
+        final keysToRemove = _cache.keys
+          .where((k) => k < start - 5 || k > end + 5)
+          .toList();
+        keysToRemove.forEach(_cache.remove);
+      }
+    }
+    
+    return _cache[index];
+  }
+  
+  void clear() {
+    _cache.clear();
+  }
+  
+  int get length => _steps.length;
+}
+
+// ============================================================
+// OPTIMIZATION: TTS Manager with Caching
+// ============================================================
+class TTSManager {
+  final Map<String, String> _cache = {};
+  final FlutterTts _tts;
+  bool _initialized = false;
+  
+  TTSManager() : _tts = FlutterTts();
+  
+  Future<void> initialize() async {
+    if (_initialized) return;
+    try {
+      await _tts.setLanguage('en-US');
+      await _tts.setSpeechRate(0.5);
+      await _tts.setPitch(1.0);
+      await _tts.setVolume(1.0);
+      _initialized = true;
+    } catch (e) {
+      print('⚠️ TTS initialization error: $e');
+    }
+  }
+  
+  Future<void> speak(String text) async {
+    if (!_initialized) await initialize();
+    if (text.isEmpty) return;
+    
+    final key = text.hashCode.toString();
+    _cache[key] = text; // Cache for potential future use
+    
+    try {
+      await _tts.speak(text);
+    } catch (e) {
+      print('⚠️ TTS speak error: $e');
+    }
+  }
+  
+  Future<void> stop() async {
+    try {
+      await _tts.stop();
+    } catch (e) {
+      // Ignore
+    }
+  }
+  
+  void clearCache() => _cache.clear();
+  
+  void dispose() {
+    clearCache();
+    try {
+      _tts.stop();
+    } catch (e) {
+      // Ignore
+    }
+  }
+}
+
+// ============================================================
+// ENHANCED: DRIVER MAP CONTROLLER
 // ============================================================
 class DriverMapController {
   // ============================================================
@@ -173,6 +391,11 @@ class DriverMapController {
   DocumentReference? driverLocationRef;
   DocumentReference? sessionRef;
   String? driverId;
+
+  // ============================================================
+  // OPTIMIZATION: Firestore Batch Manager
+  // ============================================================
+  final FirestoreBatchManager _batchManager = FirestoreBatchManager();
 
   // ============================================================
   // NAVIGATION SESSION MANAGEMENT
@@ -211,6 +434,14 @@ class DriverMapController {
   double? queuedSpeed;
 
   // ============================================================
+  // OPTIMIZATION: Last update timestamps for throttling
+  // ============================================================
+  DateTime? _lastTurnCheckTime;
+  static const Duration _turnCheckInterval = Duration(seconds: 2);
+  DateTime? _lastCameraCheckTime;
+  static const Duration _cameraCheckInterval = Duration(milliseconds: 100);
+
+  // ============================================================
   // NAVIGATION ENHANCEMENTS
   // ============================================================
   List<LatLng> currentRoutePoints = [];
@@ -220,8 +451,14 @@ class DriverMapController {
   LatLng? lastRouteOrigin;
   LatLng? lastRouteDestination;
   Duration? actualTravelDuration;
+  Duration? normalTravelDuration;
   String? travelDurationText;
   bool useActualEta = false;
+
+  // ============================================================
+  // OPTIMIZATION: Lazy Step Loader
+  // ============================================================
+  LazyStepLoader? _lazyStepLoader;
 
   // ============================================================
   // SMOOTH INTERPOLATION
@@ -257,19 +494,34 @@ class DriverMapController {
   double turnAngle = 0;
 
   // ============================================================
-  // ZOOM CONTROL
+  // ENHANCED ZOOM CONTROL - SPEED & CONTEXT AWARE
   // ============================================================
   double currentZoom = 17.0;
   static const double baseZoom = 17.0;
+  double minZoom = 14.0;
+  double maxZoom = 19.5;
   Timer? zoomSmoothingTimer;
   static const double driverOffsetY = 0.7;
+  
+  // Smooth zoom transition variables
+  double _smoothZoom = 17.0;
+  double _zoomVelocity = 0.0;
+  static const double zoomSmoothFactor = 0.15;
+  static const double zoomSmoothDamping = 0.85;
+  
+  // Zoom levels for different contexts
+  double _zoomAtSpeed = 17.0;
+  double _zoomAtJunction = 17.0;
+  double _zoomAtArrival = 17.0;
+  double _zoomAtRouteStart = 17.0;
+  bool _wasNearJunction = false;
 
   // ============================================================
   // PREDICTIVE CAMERA
   // ============================================================
   bool predictiveCameraEnabled = true;
   LatLng? predictedCameraTarget;
-  bool isMapRotating = true;
+  bool isMapRotating = false; // KEEP NORTH UP - Don't rotate map
 
   // ============================================================
   // DRIVER SPEED & HEADING
@@ -286,7 +538,7 @@ class DriverMapController {
   Timer? cameraFollowTimer;
   bool isCameraFollowing = true;
   LatLng? cameraTargetPosition;
-  double cameraBearing = 0;
+  double cameraBearing = 0; // Always 0 for North-up
   double cameraZoom = 17.0;
   LatLng? lastKnownPosition;
   bool isDriverMoving = false;
@@ -294,9 +546,19 @@ class DriverMapController {
   static const double movementThreshold = 0.5;
 
   // ============================================================
+  // OPTIMIZATION: Camera Update Throttler
+  // ============================================================
+  CameraUpdateThrottler? _cameraThrottler;
+
+  // ============================================================
   // MARKER CACHE
   // ============================================================
   final Map<String, BitmapDescriptor> markerCache = {};
+  
+  // ============================================================
+  // OPTIMIZATION: Marker Pool
+  // ============================================================
+  final MarkerPool _markerPool = MarkerPool();
 
   // ============================================================
   // CALLBACKS
@@ -339,7 +601,11 @@ class DriverMapController {
   double lastAnnouncementDistance = -1;
   List<String> announcementQueue = [];
   Function(String)? speakCallback;
-  FlutterTts? _tts;
+  
+  // ============================================================
+  // OPTIMIZATION: TTS Manager
+  // ============================================================
+  final TTSManager _ttsManager = TTSManager();
   bool _ttsInitialized = false;
 
   // ============================================================
@@ -394,7 +660,7 @@ class DriverMapController {
   Timer? arrivalAnimationTimer;
 
   // ============================================================
-  // ✅ ADDED: Arrival listener timer to stop route refreshing
+  // ADDED: Arrival listener timer to stop route refreshing
   // ============================================================
   Timer? _arrivalCheckTimer;
 
@@ -457,7 +723,7 @@ class DriverMapController {
   bool animarkerUseRotation = true;
 
   // ============================================================
-  // ✅ ENHANCED: Configuration options for feature toggles
+  // ENHANCED: Configuration options for feature toggles
   // ============================================================
   Map<String, bool> _features = {
     'voiceNavigation': true,
@@ -473,20 +739,20 @@ class DriverMapController {
   };
 
   // ============================================================
-  // ✅ ENHANCED: Error logging system
+  // ENHANCED: Error logging system
   // ============================================================
   final List<ErrorLogEntry> _errorLogs = [];
   static const int maxErrorLogs = 100;
   Function(ErrorLogEntry)? onErrorLogged;
 
   // ============================================================
-  // ✅ ENHANCED: Performance tracking
+  // ENHANCED: Performance tracking
   // ============================================================
   Map<String, Stopwatch> _performanceTimers = {};
   Map<String, Duration> _performanceMetrics = {};
 
   // ============================================================
-  // ✅ ENHANCED: Retry configuration
+  // ENHANCED: Retry configuration
   // ============================================================
   static const int _maxRetries = 3;
   static const Duration _retryDelay = Duration(seconds: 2);
@@ -512,7 +778,7 @@ class DriverMapController {
   }
 
   // ============================================================
-  // ✅ ENHANCED: Feature toggles (dynamic configuration)
+  // ENHANCED: Feature toggles (dynamic configuration)
   // ============================================================
   void setFeature(String feature, bool enabled) {
     if (_features.containsKey(feature)) {
@@ -523,7 +789,7 @@ class DriverMapController {
         case 'voiceNavigation':
           isVoiceEnabled = enabled;
           if (!enabled) {
-            _tts?.stop();
+            _ttsManager.stop();
           }
           break;
         case 'routeSnapping':
@@ -584,7 +850,7 @@ class DriverMapController {
   }
 
   // ============================================================
-  // ✅ ENHANCED: Error logging methods
+  // ENHANCED: Error logging methods
   // ============================================================
   void _logError(String message, {Map<String, dynamic>? details}) {
     final entry = ErrorLogEntry(
@@ -635,7 +901,7 @@ class DriverMapController {
   }
 
   // ============================================================
-  // ✅ ENHANCED: Performance monitoring
+  // ENHANCED: Performance monitoring
   // ============================================================
   void _startPerformanceMonitoring() {
     _performanceTimers['routeRecalculation'] = Stopwatch();
@@ -668,7 +934,7 @@ class DriverMapController {
   }
 
   // ============================================================
-  // ✅ ENHANCED: Retry logic for Firebase operations
+  // ENHANCED: Retry logic for Firebase operations
   // ============================================================
   Future<T> _withRetry<T>(Future<T> Function() operation, {String operationName = 'Firebase operation'}) async {
     int attempts = 0;
@@ -845,11 +1111,7 @@ class DriverMapController {
   void _initTTS() {
     if (_ttsInitialized) return;
     try {
-      _tts = FlutterTts();
-      _tts?.setLanguage('en-US');
-      _tts?.setSpeechRate(0.5);
-      _tts?.setPitch(1.0);
-      _tts?.setVolume(1.0);
+      _ttsManager.initialize();
       _ttsInitialized = true;
       _logInfo('TTS initialized successfully');
     } catch (e) {
@@ -874,9 +1136,7 @@ class DriverMapController {
     voiceDebounceTimer?.cancel();
     voiceDebounceTimer = Timer(const Duration(milliseconds: 300), () {
       lastSpokenInstruction = text;
-      if (_ttsInitialized && _tts != null) {
-        _tts?.speak(text);
-      }
+      _ttsManager.speak(text);
       if (speakCallback != null) {
         speakCallback!(text);
       }
@@ -1153,13 +1413,14 @@ class DriverMapController {
     _currentSessionState = state;
     
     if (driverId != null) {
-      await firestore
-          .collection('drivers')
-          .doc(driverId!)
-          .update({
-        'sessionState': stateString,
-        'updatedAt': FieldValue.serverTimestamp(),
-      });
+      // Use batch manager for driver update
+      _batchManager.addUpdate(
+        'drivers/${driverId!}',
+        {
+          'sessionState': stateString,
+          'updatedAt': FieldValue.serverTimestamp(),
+        }
+      );
     }
     
     _logInfo('Session state updated to: $stateString');
@@ -1197,7 +1458,7 @@ class DriverMapController {
       totalDuration = DateTime.now().difference(startedAt).inSeconds;
     }
 
-    await sessionRef!.update({
+    final updates = {
       'totalDistance': totalDistance / 1000,
       'totalDuration': totalDuration,
       'currentStepIndex': currentStepIndex,
@@ -1211,7 +1472,12 @@ class DriverMapController {
       },
       'currentSpeed': currentSpeed,
       'currentHeading': currentHeading,
-    });
+    };
+
+    // Use batch manager for session updates
+    if (sessionRef != null) {
+      _batchManager.addUpdate(sessionRef!.path, updates);
+    }
   }
 
   void _startSessionUpdateTimer() {
@@ -1432,7 +1698,65 @@ class DriverMapController {
   }
 
   // ============================================================
-  // DRAW ROUTE TO CUSTOMER - ENHANCED WITH ARRIVAL LISTENER
+  // OPTIMIZATION: Route Point Downsampling
+  // ============================================================
+  List<LatLng> _downsampleRoutePoints(List<LatLng> points, {double tolerance = 0.0001}) {
+    if (points.length < 100) return points;
+    
+    final result = <LatLng>[points.first];
+    for (int i = 1; i < points.length - 1; i++) {
+      final prev = points[i - 1];
+      final curr = points[i];
+      final next = points[i + 1];
+      
+      final distance = _perpendicularDistance(prev, curr, next);
+      if (distance > tolerance) {
+        result.add(curr);
+      }
+    }
+    result.add(points.last);
+    return result;
+  }
+
+  double _perpendicularDistance(LatLng p1, LatLng p2, LatLng p3) {
+    final x1 = p1.latitude, y1 = p1.longitude;
+    final x2 = p2.latitude, y2 = p2.longitude;
+    final x3 = p3.latitude, y3 = p3.longitude;
+    
+    final numerator = ((x2-x1)*(y3-y1) - (y2-y1)*(x3-x1)).abs();
+    final denominator = sqrt(pow(x2-x1, 2) + pow(y2-y1, 2));
+    return denominator > 0 ? numerator / denominator : 0;
+  }
+
+  // ============================================================
+  // OPTIMIZATION: Intelligent Route Recalculation Check
+  // ============================================================
+  bool _shouldRecalculateRoute(LatLng position, List<LatLng> route) {
+    if (route.isEmpty) return false;
+    
+    const double corridorWidth = 50.0;
+    double minDistance = double.infinity;
+    
+    // Sample every 5th point for efficiency
+    for (int i = 0; i < route.length; i += 5) {
+      final distance = Geolocator.distanceBetween(
+        position.latitude, position.longitude,
+        route[i].latitude, route[i].longitude
+      );
+      if (distance < minDistance) minDistance = distance;
+      if (minDistance < corridorWidth) return false;
+    }
+    
+    // Check if significantly off-route
+    if (minDistance > corridorWidth * 2) {
+      return true;
+    }
+    
+    return false;
+  }
+
+  // ============================================================
+  // DRAW ROUTE TO CUSTOMER - UPDATED WITH HOME_MAP LOGIC
   // ============================================================
   Future<void> drawRouteToCustomer(
     LatLng origin,
@@ -1458,7 +1782,7 @@ class DriverMapController {
     customerLocation = destination;
     driverLocation = origin;
 
-    // ✅ Reset arrival flag when starting new route
+    // Reset arrival flag when starting new route
     hasArrived = false;
     _hasArrivedAndSessionEnded = false;
 
@@ -1478,24 +1802,30 @@ class DriverMapController {
     );
     final routePoints = result['points'] as List<LatLng>;
     final duration = result['duration'] as Duration?;
+    final normalDuration = result['normalDuration'] as Duration?;
     final durationText = result['durationText'] as String?;
     final steps = result['steps'] as List<NavigationStep>;
     final alternatives = result['alternatives'] as List<List<LatLng>>? ?? [];
     final altDurations = result['alternativeDurations'] as List<Duration>? ?? [];
     _stopTimer('routeParsing');
 
-    currentRoutePoints = routePoints;
+    // OPTIMIZATION: Downsample route points
+    currentRoutePoints = _downsampleRoutePoints(routePoints);
     lastRouteOrigin = origin;
     lastRouteDestination = destination;
     actualTravelDuration = duration;
+    normalTravelDuration = normalDuration;
     travelDurationText = durationText;
     useActualEta = duration != null;
     alternativeRoutes = alternatives;
     alternativeDurations = altDurations;
     selectedRouteIndex = 0;
 
-    if (routePoints.isNotEmpty) {
-      polylines = _buildPolylinesWithTraffic(routePoints);
+    // Initialize lazy step loader
+    _lazyStepLoader = LazyStepLoader(steps);
+
+    if (currentRoutePoints.isNotEmpty) {
+      polylines = _buildPolylinesWithTraffic(currentRoutePoints);
       polylines.addAll(_buildAlternativePolylines(alternatives));
     } else {
       _logWarning('Route points empty, using fallback route');
@@ -1517,6 +1847,7 @@ class DriverMapController {
 
     if (steps.isNotEmpty) {
       routeSteps = steps;
+      _lazyStepLoader = LazyStepLoader(steps);
 
       if (orderId != null && customerId != null && driverId != null) {
         try {
@@ -1548,14 +1879,14 @@ class DriverMapController {
     startSpeedLimitMonitoring();
     initializeAnimationUpdates();
 
-    // ✅ Start arrival listener to stop route refreshing when destination reached
+    // Start arrival listener to stop route refreshing when destination reached
     _startArrivalListener();
 
     onMapUpdated?.call();
   }
 
   // ============================================================
-  // ✅ ADDED: Arrival Listener to stop route refresh
+  // ADDED: Arrival Listener to stop route refresh
   // ============================================================
   void _startArrivalListener() {
     // Cancel any existing timer
@@ -1616,7 +1947,11 @@ class DriverMapController {
     selectedRouteIndex = 0;
     trafficSegments.clear();
     
-    // ✅ Cancel arrival listener when route is cleared
+    // Clear lazy step loader
+    _lazyStepLoader?.clear();
+    _lazyStepLoader = null;
+    
+    // Cancel arrival listener when route is cleared
     _arrivalCheckTimer?.cancel();
     _arrivalCheckTimer = null;
     
@@ -1635,10 +1970,64 @@ class DriverMapController {
   }
 
   // ============================================================
-  // RECALCULATE ROUTE - ENHANCED WITH ARRIVAL CHECK
+  // ADDED: Off-route purple route to guide driver back
+  // ============================================================
+  void _showOffRoutePurpleGuidance(LatLng driverPosition) {
+    if (customerLocation == null) return;
+    
+    // Remove any existing off-route purple polyline
+    polylines.removeWhere((polyline) => 
+      polyline.polylineId.value == 'off_route_purple_guide'
+    );
+    
+    // Draw a purple route from driver's current position to customer
+    // This is a direct route showing the driver how to get back
+    polylines.add(
+      Polyline(
+        polylineId: const PolylineId('off_route_purple_guide'),
+        points: [driverPosition, customerLocation!],
+        color: Colors.purple,
+        width: 8,
+        startCap: Cap.roundCap,
+        endCap: Cap.roundCap,
+        jointType: JointType.round,
+        patterns: [PatternItem.dash(15), PatternItem.gap(10)],
+      ),
+    );
+    
+    // Add a label polyline with instruction
+    polylines.add(
+      Polyline(
+        polylineId: const PolylineId('off_route_purple_instruction'),
+        points: [
+          LatLng(
+            (driverPosition.latitude + customerLocation!.latitude) / 2,
+            (driverPosition.longitude + customerLocation!.longitude) / 2
+          ),
+          LatLng(
+            (driverPosition.latitude + customerLocation!.latitude) / 2 + 0.0001,
+            (driverPosition.longitude + customerLocation!.longitude) / 2
+          )
+        ],
+        color: Colors.purple.shade300,
+        width: 2,
+        startCap: Cap.roundCap,
+        endCap: Cap.roundCap,
+      ),
+    );
+    
+    // Speak guidance
+    speak('You are off-route. Follow the purple route to return to your destination.');
+    onTurnAlert?.call('🟣 Off-route! Follow purple route back to client', 'warning');
+    
+    onMapUpdated?.call();
+  }
+
+  // ============================================================
+  // RECALCULATE ROUTE - ENHANCED WITH ARRIVAL CHECK AND PURPLE GUIDANCE
   // ============================================================
   void recalculateRouteIfNeeded(LatLng driverPosition, String vehicleType, String numberPlate) {
-    // ✅ If arrived, do NOT recalculate
+    // If arrived, do NOT recalculate
     if (hasArrived || _hasArrivedAndSessionEnded) {
       return;
     }
@@ -1653,8 +2042,14 @@ class DriverMapController {
     if (isRecalculatingRoute) return;
     if (currentRoutePoints.isEmpty) return;
 
-    if (isDriverOffRoute(driverPosition, currentRoutePoints)) {
-      _logInfo('🔄 Driver is off-route, recalculating...');
+    // Check if driver is off-route
+    final bool isOffRoute = _shouldRecalculateRoute(driverPosition, currentRoutePoints);
+    
+    if (isOffRoute) {
+      // Show purple guidance route to help driver get back on track
+      _showOffRoutePurpleGuidance(driverPosition);
+      
+      _logInfo('🔄 Driver is off-route, showing purple guidance and recalculating...');
       isRecalculatingRoute = true;
       _startTimer('routeRecalculation');
 
@@ -1663,7 +2058,7 @@ class DriverMapController {
       }
 
       routeRecalculationTimer = Timer(const Duration(seconds: 3), () async {
-        // ✅ Double-check arrival before recalculating
+        // Double-check arrival before recalculating
         if (hasArrived || _hasArrivedAndSessionEnded) {
           isRecalculatingRoute = false;
           _logInfo('⏹️ Skip recalculation - already arrived');
@@ -1680,27 +2075,37 @@ class DriverMapController {
           );
           final points = result['points'] as List<LatLng>;
           final duration = result['duration'] as Duration?;
+          final normalDuration = result['normalDuration'] as Duration?;
           final durationText = result['durationText'] as String?;
           final steps = result['steps'] as List<NavigationStep>;
           final alternatives = result['alternatives'] as List<List<LatLng>>? ?? [];
           final altDurations = result['alternativeDurations'] as List<Duration>? ?? [];
 
           if (points.isNotEmpty) {
-            currentRoutePoints = points;
+            // Remove purple guidance since driver is back on route
+            polylines.removeWhere((polyline) => 
+              polyline.polylineId.value == 'off_route_purple_guide' ||
+              polyline.polylineId.value == 'off_route_purple_instruction'
+            );
+            
+            // Downsample recalculated route
+            currentRoutePoints = _downsampleRoutePoints(points);
             lastRouteOrigin = origin;
             lastRouteDestination = destination;
             actualTravelDuration = duration;
+            normalTravelDuration = normalDuration;
             travelDurationText = durationText;
             useActualEta = duration != null;
             alternativeRoutes = alternatives;
             alternativeDurations = altDurations;
             selectedRouteIndex = 0;
 
-            polylines = _buildPolylinesWithTraffic(points);
+            polylines = _buildPolylinesWithTraffic(currentRoutePoints);
             polylines.addAll(_buildAlternativePolylines(alternatives));
 
             if (steps.isNotEmpty) {
               routeSteps = steps;
+              _lazyStepLoader = LazyStepLoader(steps);
               if (_isSessionActive && !_navigationInitialized) {
                 _initializeNavigation();
                 updateSessionState(NavigationSessionState.navigating);
@@ -1715,7 +2120,7 @@ class DriverMapController {
               estimatedMinutes = duration.inMinutes > 0 ? duration.inMinutes : 1;
             }
 
-            speak('Route recalculated.');
+            speak('Route recalculated. You are back on track.');
             onMapUpdated?.call();
             _logInfo('✅ Route recalculated successfully');
           } else {
@@ -1742,7 +2147,7 @@ class DriverMapController {
     hasArrived = true;
     _hasArrivedAndSessionEnded = true;
     
-    // ✅ Cancel arrival listener on arrival
+    // Cancel arrival listener on arrival
     _arrivalCheckTimer?.cancel();
     _arrivalCheckTimer = null;
     
@@ -1756,15 +2161,19 @@ class DriverMapController {
     }
 
     if (mapController != null) {
-      mapController!.animateCamera(
-        CameraUpdate.newCameraPosition(
-          CameraPosition(
-            target: driverLocation ?? customerLocation!,
-            zoom: 16,
-            tilt: 0,
+      try {
+        mapController!.animateCamera(
+          CameraUpdate.newCameraPosition(
+            CameraPosition(
+              target: driverLocation ?? customerLocation!,
+              zoom: 16,
+              tilt: 0,
+            ),
           ),
-        ),
-      );
+        );
+      } catch (e) {
+        // Ignore - controller may be disposed
+      }
     }
 
     onMapUpdated?.call();
@@ -1786,6 +2195,11 @@ class DriverMapController {
     hasAnnouncedCurrentStep = false;
     lastAnnouncementDistance = -1;
     announcementQueue.clear();
+
+    // Initialize lazy step loader
+    if (routeSteps.isNotEmpty) {
+      _lazyStepLoader = LazyStepLoader(routeSteps);
+    }
 
     if (routeSteps.isNotEmpty) {
       _updateCurrentStepInfo();
@@ -1897,9 +2311,8 @@ class DriverMapController {
           position.latitude,
           position.longitude,
         );
-        if (distance < minDistanceThreshold) {
-          return;
-        }
+        // Skip if moved less than 10 meters
+        if (distance < 10.0) return;
       }
       if (lastFirestoreUpdateTime != null) {
         final elapsed = now.difference(lastFirestoreUpdateTime!);
@@ -1937,20 +2350,24 @@ class DriverMapController {
     if (driverLocationRef == null) return;
     try {
       final now = DateTime.now();
-      await driverLocationRef!.set({
-        'position': {
-          'lat': position.latitude,
-          'lng': position.longitude,
-        },
-        'heading': heading,
-        'speed': speed,
-        'timestamp': FieldValue.serverTimestamp(),
-        'updatedAt': now.toIso8601String(),
-      }, SetOptions(merge: true));
+      // Use batch manager for location updates
+      _batchManager.addUpdate(
+        driverLocationRef!.path,
+        {
+          'position': {
+            'lat': position.latitude,
+            'lng': position.longitude,
+          },
+          'heading': heading,
+          'speed': speed,
+          'timestamp': FieldValue.serverTimestamp(),
+          'updatedAt': now.toIso8601String(),
+        }
+      );
       lastSentPosition = position;
       lastFirestoreUpdateTime = now;
       isFirestoreUpdateQueued = false;
-      _logInfo('Firestore update sent: ${position.latitude}, ${position.longitude}');
+      _logInfo('Firestore update queued: ${position.latitude}, ${position.longitude}');
     } catch (e) {
       _logError('Error sending location to Firestore', details: {'error': e.toString()});
     }
@@ -1977,6 +2394,7 @@ class DriverMapController {
       'lastUpdateTime': lastFirestoreUpdateTime?.toIso8601String(),
       'isQueued': isFirestoreUpdateQueued,
       'queuedPosition': queuedPosition,
+      'batchSize': _batchManager._batch.length,
     };
   }
 
@@ -2290,11 +2708,12 @@ class DriverMapController {
     _animatedDrivers.clear();
     _driverPaths.clear();
     _staticDrivers.clear();
+    _markerPool.clear();
     onMapUpdated?.call();
   }
 
   // ============================================================
-  // GOOGLE DIRECTIONS API - FIXED: Returns empty response instead of throwing
+  // GOOGLE DIRECTIONS API - UPDATED WITH HOME_MAP LOGIC
   // ============================================================
   Future<Map<String, dynamic>> getRouteWithDetails(
     LatLng origin,
@@ -2302,17 +2721,15 @@ class DriverMapController {
     bool getAlternatives = true
   }) async {
     try {
-      String baseUrl = 'https://maps.googleapis.com/maps/api/directions/json?origin=${origin.latitude},${origin.longitude}'
+      String url = 'https://maps.googleapis.com/maps/api/directions/json'
+          '?origin=${origin.latitude},${origin.longitude}'
           '&destination=${destination.latitude},${destination.longitude}'
           '&key=$googleAPIKey'
           '&departure_time=now'
           '&traffic_model=best_guess';
+      
       if (getAlternatives) {
-        baseUrl += '&alternatives=true';
-      }
-      String url = baseUrl;
-      if (useCorsProxy) {
-        url = '$corsProxyUrl$baseUrl';
+        url += '&alternatives=true';
       }
       
       _logInfo('Fetching route from: $url');
@@ -2321,10 +2738,9 @@ class DriverMapController {
         Uri.parse(url),
         headers: {
           'Content-Type': 'application/json',
-          'X-Requested-With': 'XMLHttpRequest',
         },
       ).timeout(
-        const Duration(seconds: 30),
+        const Duration(seconds: 15),
         onTimeout: () {
           _logError('Route request timed out');
           return http.Response('{"status":"TIMEOUT"}', 408);
@@ -2342,10 +2758,21 @@ class DriverMapController {
         } else if (data['status'] == 'ZERO_RESULTS') {
           _logWarning('No route found between these points');
           return _emptyRouteResponse();
+        } else if (data['status'] == 'OVER_QUERY_LIMIT') {
+          _logWarning('API Query Limit Exceeded');
+          return _emptyRouteResponse();
+        } else if (data['status'] == 'REQUEST_DENIED') {
+          _logError('⚠️ API KEY ERROR: ${data['error_message']}');
+          _showApiKeyError();
+          return _emptyRouteResponse();
         } else {
           _logWarning('API Error: ${data['status']} - ${data['error_message'] ?? 'No message'}');
           return _emptyRouteResponse();
         }
+      } else if (response.statusCode == 403) {
+        _logError('⚠️ 403 Forbidden - API Key issue or billing not enabled');
+        _showApiKeyError();
+        return _emptyRouteResponse();
       } else {
         _logWarning('HTTP Error: ${response.statusCode}');
         return _emptyRouteResponse();
@@ -2356,156 +2783,229 @@ class DriverMapController {
     }
   }
 
-  // ✅ FIXED: Complete implementation of direct route fetch
-  Future<Map<String, dynamic>> _getRouteDirect(
-    LatLng origin,
-    LatLng destination,
-    bool getAlternatives
-  ) async {
-    try {
-      String url = 'https://maps.googleapis.com/maps/api/directions/json?origin=${origin.latitude},${origin.longitude}'
-          '&destination=${destination.latitude},${destination.longitude}'
-          '&key=$googleAPIKey'
-          '&departure_time=now'
-          '&traffic_model=best_guess';
-      if (getAlternatives) {
-        url += '&alternatives=true';
-      }
-      final response = await http.get(Uri.parse(url)).timeout(
-        const Duration(seconds: 20),
+  void _showApiKeyError() {
+    if (_context != null) {
+      ScaffoldMessenger.of(_context!).showSnackBar(
+        const SnackBar(
+          content: Text('⚠️ Google Maps API Error. Please check API key and billing.'),
+          backgroundColor: Colors.red,
+          duration: Duration(seconds: 5),
+        ),
       );
-      if (response.statusCode == 200) {
-        final data = jsonDecode(response.body);
-        if (data['status'] == 'OK') {
-          return _parseRouteResponse(data, getAlternatives);
-        }
-      }
-      return _emptyRouteResponse();
-    } catch (e) {
-      _logError('Direct request error', details: {'error': e.toString()});
-      return _emptyRouteResponse();
     }
   }
 
   Map<String, dynamic> _parseRouteResponse(Map<String, dynamic> data, bool getAlternatives) {
     try {
-      final routes = data['routes'] as List;
-      final mainRoute = routes[0];
-      final overviewPolyline = mainRoute['overview_polyline']['points'];
-      final points = _decodePolyline(overviewPolyline);
+      final routes = data['routes'] as List?;
+      if (routes == null || routes.isEmpty) {
+        _logWarning('No routes found in response');
+        return _emptyRouteResponse();
+      }
+      
+      final mainRoute = routes[0] as Map<String, dynamic>?;
+      if (mainRoute == null) {
+        _logWarning('Main route is null');
+        return _emptyRouteResponse();
+      }
+      
+      // Safely get overview polyline
+      final overviewPolyline = mainRoute['overview_polyline'] as Map<String, dynamic>?;
+      if (overviewPolyline == null) {
+        _logWarning('No overview polyline found');
+        return _emptyRouteResponse();
+      }
+      
+      final polylinePoints = overviewPolyline['points'] as String?;
+      if (polylinePoints == null || polylinePoints.isEmpty) {
+        _logWarning('No polyline points found');
+        return _emptyRouteResponse();
+      }
+      
+      final points = _decodePolyline(polylinePoints);
+      if (points.isEmpty) {
+        _logWarning('Decoded polyline is empty');
+        return _emptyRouteResponse();
+      }
+      
       Duration? travelDuration;
+      Duration? normalDuration;
       String? durationText;
       List<NavigationStep> steps = [];
-      if (mainRoute['legs'] != null && mainRoute['legs'].isNotEmpty) {
-        final leg = mainRoute['legs'][0];
-        if (leg['duration'] != null) {
-          final seconds = leg['duration']['value'] as int;
-          travelDuration = Duration(seconds: seconds);
-          durationText = leg['duration']['text'] as String?;
-        }
-        if (leg['steps'] != null) {
-          for (int i = 0; i < leg['steps'].length; i++) {
-            final step = leg['steps'][i];
-            final stepPoints = _decodePolyline(step['polyline']['points']);
-            final instruction = step['html_instructions'] ?? step['instructions'] ?? 'Continue';
-            
-            String roadName = '';
-            final matches = RegExp(r'onto\s+([^<]+)').firstMatch(instruction);
-            if (matches != null && matches.group(1) != null) {
-              roadName = matches.group(1)!.trim();
-            } else {
-              final parts = instruction.split(' ');
-              if (parts.length > 2) {
-                roadName = parts.sublist(2).join(' ').replaceAll('<b>', '').replaceAll('</b>', '');
-              }
+      
+      final legs = mainRoute['legs'] as List?;
+      if (legs != null && legs.isNotEmpty) {
+        final leg = legs[0] as Map<String, dynamic>?;
+        if (leg != null) {
+          // Safely get duration
+          final duration = leg['duration'] as Map<String, dynamic>?;
+          if (duration != null) {
+            final seconds = duration['value'] as int?;
+            if (seconds != null) {
+              normalDuration = Duration(seconds: seconds);
             }
-            
-            String roadShield = '';
-            final shieldMatches = RegExp(r'([A-Z]\d{1,4})').firstMatch(roadName);
-            if (shieldMatches != null) {
-              roadShield = shieldMatches.group(1)!;
+          }
+          
+          // Safely get duration in traffic
+          final durationInTraffic = leg['duration_in_traffic'] as Map<String, dynamic>?;
+          if (durationInTraffic != null) {
+            final seconds = durationInTraffic['value'] as int?;
+            if (seconds != null) {
+              travelDuration = Duration(seconds: seconds);
+              durationText = durationInTraffic['text'] as String?;
             }
-            
-            String maneuver = step['maneuver'] ?? 'straight';
-            double startHeading = 0;
-            double endHeading = 0;
-            if (stepPoints.length >= 2) {
-              startHeading = _calculateBearing(
-                stepPoints[0],
-                stepPoints[min(1, stepPoints.length - 1)]
-              );
-              endHeading = _calculateBearing(
-                stepPoints[max(0, stepPoints.length - 2)],
-                stepPoints.last
-              );
+          } else if (duration != null) {
+            final seconds = duration['value'] as int?;
+            if (seconds != null) {
+              travelDuration = Duration(seconds: seconds);
+              durationText = duration['text'] as String?;
             }
-            
-            if (i < leg['steps'].length - 1) {
-              final nextStep = leg['steps'][i + 1];
-              final nextStepPoints = _decodePolyline(nextStep['polyline']['points']);
-              double nextStartHeading = 0;
-              if (nextStepPoints.length >= 2) {
-                nextStartHeading = _calculateBearing(
-                  nextStepPoints[0],
-                  nextStepPoints[min(1, nextStepPoints.length - 1)]
-                );
-              }
-              double turnAngle = (nextStartHeading - endHeading).abs() % 360;
-              if (turnAngle > 180) turnAngle = 360 - turnAngle;
+          }
+          
+          // Safely parse steps
+          final legSteps = leg['steps'] as List?;
+          if (legSteps != null) {
+            for (int i = 0; i < legSteps.length; i++) {
+              final step = legSteps[i] as Map<String, dynamic>?;
+              if (step == null) continue;
               
-              if (turnAngle > 30 && turnAngle < 80) {
-                final cross = _crossProduct(
-                  stepPoints.last,
-                  stepPoints[max(0, stepPoints.length - 2)],
-                  nextStepPoints[min(1, nextStepPoints.length - 1)]
-                );
-                maneuver = cross > 0 ? 'turn-left' : 'turn-right';
-              } else if (turnAngle >= 80) {
-                final cross = _crossProduct(
-                  stepPoints.last,
-                  stepPoints[max(0, stepPoints.length - 2)],
-                  nextStepPoints[min(1, nextStepPoints.length - 1)]
-                );
-                maneuver = cross > 0 ? 'turn-sharp-left' : 'turn-sharp-right';
-              } else if (turnAngle > 5 && turnAngle <= 30) {
-                final cross = _crossProduct(
-                  stepPoints.last,
-                  stepPoints[max(0, stepPoints.length - 2)],
-                  nextStepPoints[min(1, nextStepPoints.length - 1)]
-                );
-                maneuver = cross > 0 ? 'turn-slight-left' : 'turn-slight-right';
+              final stepPolyline = step['polyline'] as Map<String, dynamic>?;
+              if (stepPolyline == null) continue;
+              
+              final stepPointsStr = stepPolyline['points'] as String?;
+              if (stepPointsStr == null) continue;
+              
+              final stepPoints = _decodePolyline(stepPointsStr);
+              if (stepPoints.isEmpty) continue;
+              
+              final instruction = (step['html_instructions'] ?? step['instructions'] ?? 'Continue') as String;
+              
+              String roadName = '';
+              final matches = RegExp(r'onto\s+([^<]+)').firstMatch(instruction);
+              if (matches != null && matches.group(1) != null) {
+                roadName = matches.group(1)!.trim();
+              } else {
+                final parts = instruction.split(' ');
+                if (parts.length > 2) {
+                  roadName = parts.sublist(2).join(' ').replaceAll('<b>', '').replaceAll('</b>', '');
+                }
               }
+              
+              String roadShield = '';
+              final shieldMatches = RegExp(r'([A-Z]\d{1,4})').firstMatch(roadName);
+              if (shieldMatches != null) {
+                roadShield = shieldMatches.group(1)!;
+              }
+              
+              String maneuver = step['maneuver'] ?? 'straight';
+              double startHeading = 0;
+              double endHeading = 0;
+              if (stepPoints.length >= 2) {
+                startHeading = _calculateBearing(
+                  stepPoints[0],
+                  stepPoints[min(1, stepPoints.length - 1)]
+                );
+                endHeading = _calculateBearing(
+                  stepPoints[max(0, stepPoints.length - 2)],
+                  stepPoints.last
+                );
+              }
+              
+              if (i < legSteps.length - 1) {
+                final nextStep = legSteps[i + 1] as Map<String, dynamic>?;
+                if (nextStep != null) {
+                  final nextPolyline = nextStep['polyline'] as Map<String, dynamic>?;
+                  if (nextPolyline != null) {
+                    final nextPointsStr = nextPolyline['points'] as String?;
+                    if (nextPointsStr != null) {
+                      final nextStepPoints = _decodePolyline(nextPointsStr);
+                      if (nextStepPoints.length >= 2) {
+                        double nextStartHeading = _calculateBearing(
+                          nextStepPoints[0],
+                          nextStepPoints[min(1, nextStepPoints.length - 1)]
+                        );
+                        
+                        double turnAngle = (nextStartHeading - endHeading).abs() % 360;
+                        if (turnAngle > 180) turnAngle = 360 - turnAngle;
+                        
+                        if (turnAngle > 30 && turnAngle < 80) {
+                          final cross = _crossProduct(
+                            stepPoints.last,
+                            stepPoints[max(0, stepPoints.length - 2)],
+                            nextStepPoints[min(1, nextStepPoints.length - 1)]
+                          );
+                          maneuver = cross > 0 ? 'turn-left' : 'turn-right';
+                        } else if (turnAngle >= 80) {
+                          final cross = _crossProduct(
+                            stepPoints.last,
+                            stepPoints[max(0, stepPoints.length - 2)],
+                            nextStepPoints[min(1, nextStepPoints.length - 1)]
+                          );
+                          maneuver = cross > 0 ? 'turn-sharp-left' : 'turn-sharp-right';
+                        } else if (turnAngle > 5 && turnAngle <= 30) {
+                          final cross = _crossProduct(
+                            stepPoints.last,
+                            stepPoints[max(0, stepPoints.length - 2)],
+                            nextStepPoints[min(1, nextStepPoints.length - 1)]
+                          );
+                          maneuver = cross > 0 ? 'turn-slight-left' : 'turn-slight-right';
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+              
+              if (instruction.toLowerCase().contains('turn left') || instruction.toLowerCase().contains('turn-left')) {
+                maneuver = 'turn-left';
+              } else if (instruction.toLowerCase().contains('turn right') || instruction.toLowerCase().contains('turn-right')) {
+                maneuver = 'turn-right';
+              }
+              
+              List<LaneInfo> lanes = _getLaneInfo(maneuver);
+              
+              final stepDuration = step['duration'] as Map<String, dynamic>?;
+              Duration stepDurationObj = Duration.zero;
+              String stepDurationText = '';
+              if (stepDuration != null) {
+                final seconds = stepDuration['value'] as int?;
+                if (seconds != null) {
+                  stepDurationObj = Duration(seconds: seconds);
+                }
+                stepDurationText = stepDuration['text'] as String? ?? '';
+              }
+              
+              final stepDistance = step['distance'] as Map<String, dynamic>?;
+              double stepDistanceVal = 0;
+              String stepDistanceText = '';
+              if (stepDistance != null) {
+                stepDistanceVal = (stepDistance['value'] as int? ?? 0).toDouble();
+                stepDistanceText = stepDistance['text'] as String? ?? '';
+              }
+              
+              steps.add(NavigationStep(
+                instruction: instruction.replaceAll(RegExp(r'<[^>]*>'), ''),
+                maneuver: maneuver,
+                distance: stepDistanceVal,
+                distanceText: stepDistanceText,
+                duration: stepDurationObj,
+                durationText: stepDurationText,
+                startLocation: LatLng(
+                  step['start_location']['lat'] as double? ?? 0,
+                  step['start_location']['lng'] as double? ?? 0,
+                ),
+                endLocation: LatLng(
+                  step['end_location']['lat'] as double? ?? 0,
+                  step['end_location']['lng'] as double? ?? 0,
+                ),
+                points: stepPoints,
+                roadName: roadName,
+                roadShield: roadShield,
+                lanes: lanes,
+                startHeading: startHeading,
+                endHeading: endHeading,
+              ));
             }
-            
-            if (instruction.toLowerCase().contains('turn left') || instruction.toLowerCase().contains('turn-left')) {
-              maneuver = 'turn-left';
-            } else if (instruction.toLowerCase().contains('turn right') || instruction.toLowerCase().contains('turn-right')) {
-              maneuver = 'turn-right';
-            }
-            
-            List<LaneInfo> lanes = _getLaneInfo(maneuver);
-            steps.add(NavigationStep(
-              instruction: instruction.replaceAll(RegExp(r'<[^>]*>'), ''),
-              maneuver: maneuver,
-              distance: (step['distance']['value'] as int).toDouble(),
-              distanceText: step['distance']['text'] ?? '',
-              duration: Duration(seconds: step['duration']['value'] as int),
-              durationText: step['duration']['text'] ?? '',
-              startLocation: LatLng(
-                step['start_location']['lat'] as double,
-                step['start_location']['lng'] as double,
-              ),
-              endLocation: LatLng(
-                step['end_location']['lat'] as double,
-                step['end_location']['lng'] as double,
-              ),
-              points: stepPoints,
-              roadName: roadName,
-              roadShield: roadShield,
-              lanes: lanes,
-              startHeading: startHeading,
-              endHeading: endHeading,
-            ));
           }
         }
       }
@@ -2514,15 +3014,29 @@ class DriverMapController {
       List<Duration> altDurations = [];
       if (getAlternatives && routes.length > 1) {
         for (int i = 1; i < routes.length && i < 3; i++) {
-          final route = routes[i];
-          final altPolyline = route['overview_polyline']['points'];
-          final altPoints = _decodePolyline(altPolyline);
+          final route = routes[i] as Map<String, dynamic>?;
+          if (route == null) continue;
+          
+          final altOverview = route['overview_polyline'] as Map<String, dynamic>?;
+          if (altOverview == null) continue;
+          
+          final altPointsStr = altOverview['points'] as String?;
+          if (altPointsStr == null) continue;
+          
+          final altPoints = _decodePolyline(altPointsStr);
           alternatives.add(altPoints);
-          if (route['legs'] != null && route['legs'].isNotEmpty) {
-            final leg = route['legs'][0];
-            if (leg['duration'] != null) {
-              final seconds = leg['duration']['value'] as int;
-              altDurations.add(Duration(seconds: seconds));
+          
+          final altLegs = route['legs'] as List?;
+          if (altLegs != null && altLegs.isNotEmpty) {
+            final altLeg = altLegs[0] as Map<String, dynamic>?;
+            if (altLeg != null) {
+              final altDuration = altLeg['duration'] as Map<String, dynamic>?;
+              if (altDuration != null) {
+                final seconds = altDuration['value'] as int?;
+                if (seconds != null) {
+                  altDurations.add(Duration(seconds: seconds));
+                }
+              }
             }
           }
         }
@@ -2531,6 +3045,7 @@ class DriverMapController {
       return {
         'points': points,
         'duration': travelDuration,
+        'normalDuration': normalDuration,
         'durationText': durationText,
         'steps': steps,
         'alternatives': alternatives,
@@ -2546,6 +3061,7 @@ class DriverMapController {
     return {
       'points': [],
       'duration': null,
+      'normalDuration': null,
       'durationText': null,
       'steps': [],
       'alternatives': [],
@@ -2648,15 +3164,19 @@ class DriverMapController {
   }
 
   // ============================================================
-  // POLYLINES BUILDERS
+  // OPTIMIZATION: Efficient Polyline Building
   // ============================================================
   Set<Polyline> _buildPolylinesWithTraffic(List<LatLng> points, {Color? trafficColor}) {
     final color = trafficColor ?? currentTrafficColor;
     final polylines = <Polyline>{};
+    
+    // Simplify points for better performance
+    final simplifiedPoints = _downsampleRoutePoints(points, tolerance: 0.00005);
+    
     polylines.add(
       Polyline(
         polylineId: const PolylineId('driver_route_shadow'),
-        points: points,
+        points: simplifiedPoints,
         color: Colors.black.withOpacity(0.3),
         width: 24,
         startCap: Cap.roundCap,
@@ -2667,7 +3187,7 @@ class DriverMapController {
     polylines.add(
       Polyline(
         polylineId: const PolylineId('driver_route'),
-        points: points,
+        points: simplifiedPoints,
         color: color,
         width: 16,
         startCap: Cap.roundCap,
@@ -2678,7 +3198,7 @@ class DriverMapController {
     polylines.add(
       Polyline(
         polylineId: const PolylineId('driver_route_border'),
-        points: points,
+        points: simplifiedPoints,
         color: Colors.white.withOpacity(0.3),
         width: 20,
         startCap: Cap.roundCap,
@@ -2689,7 +3209,7 @@ class DriverMapController {
     polylines.add(
       Polyline(
         polylineId: const PolylineId('driver_route_center'),
-        points: points,
+        points: simplifiedPoints,
         color: Colors.white.withOpacity(0.15),
         width: 3,
         startCap: Cap.roundCap,
@@ -2709,11 +3229,13 @@ class DriverMapController {
     for (int i = 0; i < trafficData.length; i++) {
       final segment = trafficData[i];
       final segmentPoints = segment['points'] as List<LatLng>;
+      // Simplify segment points
+      final simplified = _downsampleRoutePoints(segmentPoints, tolerance: 0.00005);
       final color = segment['color'] as Color? ?? Colors.green;
       result.add(
         Polyline(
           polylineId: PolylineId('traffic_segment_$i'),
-          points: segmentPoints,
+          points: simplified,
           color: color,
           width: 18,
           startCap: Cap.roundCap,
@@ -2742,17 +3264,22 @@ class DriverMapController {
     };
   }
 
+  // ============================================================
+  // BUILD ALTERNATIVE POLYLINES - CHANGED GRAY TO BLACK DASHED
+  // ============================================================
   Set<Polyline> _buildAlternativePolylines(List<List<LatLng>> alternatives) {
     final result = <Polyline>{};
     for (int i = 0; i < alternatives.length; i++) {
       final altPoints = alternatives[i];
       if (altPoints.isEmpty) continue;
+      // Simplify alternative route points
+      final simplified = _downsampleRoutePoints(altPoints, tolerance: 0.0001);
       final isSelected = (i == selectedRouteIndex - 1);
       result.add(
         Polyline(
           polylineId: PolylineId('alternative_$i'),
-          points: altPoints,
-          color: isSelected ? const Color(0xFF1A73E8) : Colors.grey.withOpacity(0.5),
+          points: simplified,
+          color: isSelected ? const Color(0xFF1A73E8) : Colors.black.withOpacity(0.6),
           width: isSelected ? 14 : 6,
           startCap: Cap.roundCap,
           endCap: Cap.roundCap,
@@ -2765,7 +3292,7 @@ class DriverMapController {
   }
 
   // ============================================================
-  // SELECT ALTERNATIVE ROUTE
+  // SELECT ALTERNATIVE ROUTE - Updated to remove purple guidance
   // ============================================================
   void selectAlternativeRoute(int index) {
     if (!getFeature('alternativeRoutes')) {
@@ -2777,6 +3304,12 @@ class DriverMapController {
     if (index < alternativeRoutes.length) {
       final altPoints = alternativeRoutes[index];
       if (altPoints.isNotEmpty) {
+        // Remove purple guidance when selecting alternative
+        polylines.removeWhere((polyline) => 
+          polyline.polylineId.value == 'off_route_purple_guide' ||
+          polyline.polylineId.value == 'off_route_purple_instruction'
+        );
+        
         currentRoutePoints = altPoints;
         polylines = _buildPolylinesWithTraffic(altPoints);
         polylines.addAll(_buildAlternativePolylines(alternativeRoutes));
@@ -2836,6 +3369,9 @@ class DriverMapController {
     }
   }
 
+  // ============================================================
+  // CHECK TURN ALERTS
+  // ============================================================
   void _checkTurnAlerts() {
     if (hasArrived || _hasArrivedAndSessionEnded) {
       return;
@@ -2844,6 +3380,13 @@ class DriverMapController {
     if (driverLocation == null || routeSteps.isEmpty || currentStepIndex >= routeSteps.length) {
       return;
     }
+    
+    // Throttle turn checks
+    if (_lastTurnCheckTime != null) {
+      final elapsed = DateTime.now().difference(_lastTurnCheckTime!);
+      if (elapsed < _turnCheckInterval) return;
+    }
+    _lastTurnCheckTime = DateTime.now();
     
     final currentStep = routeSteps[currentStepIndex];
     final distanceToStepEnd = Geolocator.distanceBetween(
@@ -2983,7 +3526,6 @@ class DriverMapController {
     }
   }
 
-  // ✅ FIXED: Integrated junction proximity check
   void _checkJunctionProximity(double distanceToStepEnd, String roadName, String maneuver) {
     if (!getFeature('junctionOverlay')) {
       showJunctionOverlay = false;
@@ -3258,6 +3800,7 @@ class DriverMapController {
             
             if (stepsToRemove > 0 && stepsToRemove < routeSteps.length) {
               routeSteps = routeSteps.sublist(stepsToRemove);
+              _lazyStepLoader = LazyStepLoader(routeSteps);
               currentStepIndex = currentStepIndex - stepsToRemove;
               if (currentStepIndex < 0) currentStepIndex = 0;
               _updateCurrentStepInfo();
@@ -3364,21 +3907,31 @@ class DriverMapController {
   }
 
   // ============================================================
-  // CAMERA FOLLOWING
+  // ENHANCED CAMERA FOLLOWING - WITH DYNAMIC ZOOM
   // ============================================================
   void startCameraFollowing() {
     cameraFollowTimer?.cancel();
     if (driverLocation != null) {
       cameraTargetPosition = driverLocation;
-      cameraBearing = currentHeading;
+      cameraBearing = 0; // Always North-up
       cameraZoom = baseZoom;
+      _smoothZoom = baseZoom;
     }
     movementCheckTimer?.cancel();
     movementCheckTimer = Timer.periodic(const Duration(milliseconds: 500), (timer) {
       _checkDriverMovement();
     });
-    cameraFollowTimer = Timer.periodic(const Duration(milliseconds: 100), (timer) {
-      _updateCameraIfNeeded();
+    
+    // Initialize camera throttler
+    if (mapController != null) {
+      _cameraThrottler = CameraUpdateThrottler(
+        mapController!,
+        throttleInterval: const Duration(milliseconds: 100),
+      );
+    }
+    
+    cameraFollowTimer = Timer.periodic(const Duration(milliseconds: 50), (timer) {
+      _updateDynamicCameraPosition();
     });
   }
 
@@ -3402,14 +3955,144 @@ class DriverMapController {
     }
   }
 
-  void _updateCameraIfNeeded() {
+  // ============================================================
+  // ENHANCED DYNAMIC ZOOM CALCULATION - SPEED & CONTEXT AWARE
+  // ============================================================
+  double _calculateDynamicZoom() {
+    double targetZoom = baseZoom;
+    
+    // 1. Speed-based zoom (Zoom out when faster, zoom in when slower)
+    if (currentSpeed < 5) {
+      _zoomAtSpeed = 19.5; // Stopped - very close
+    } else if (currentSpeed < 10) {
+      _zoomAtSpeed = 19.0; // Very slow (traffic)
+    } else if (currentSpeed < 20) {
+      _zoomAtSpeed = 18.5; // Slow moving
+    } else if (currentSpeed < 35) {
+      _zoomAtSpeed = 18.0; // Normal city driving
+    } else if (currentSpeed < 50) {
+      _zoomAtSpeed = 17.5; // Fast city driving
+    } else if (currentSpeed < 70) {
+      _zoomAtSpeed = 17.0; // Highway
+    } else {
+      _zoomAtSpeed = 16.5; // Very fast highway
+    }
+    
+    // 2. Junction proximity zoom - get closer at turns
+    if (isNearJunction && junctionDistance < 100) {
+      _zoomAtJunction = 19.0;
+    } else if (isNearJunction && junctionDistance < 200) {
+      _zoomAtJunction = 18.5;
+    } else {
+      _zoomAtJunction = _zoomAtSpeed;
+    }
+    
+    // 3. Arrival zoom - maximum zoom when arriving
+    if (hasArrived || (distanceToCustomer != null && distanceToCustomer! < 100)) {
+      _zoomAtArrival = 19.5;
+    } else if (distanceToCustomer != null && distanceToCustomer! < 500) {
+      _zoomAtArrival = 19.0;
+    } else {
+      _zoomAtArrival = _zoomAtJunction;
+    }
+    
+    // 4. Route start zoom - moderate zoom when starting
+    if (currentRoutePoints.length > 10 && !hasArrived && distanceToCustomer != null && distanceToCustomer! > 1000) {
+      _zoomAtRouteStart = 17.0;
+    } else {
+      _zoomAtRouteStart = _zoomAtArrival;
+    }
+    
+    // 5. Combine zoom factors with priority
+    if (hasArrived || (distanceToCustomer != null && distanceToCustomer! < 100)) {
+      targetZoom = _zoomAtArrival;
+    } else if (isNearJunction) {
+      targetZoom = _zoomAtJunction;
+    } else if (distanceToCustomer != null && distanceToCustomer! > 1000) {
+      targetZoom = _zoomAtRouteStart;
+    } else {
+      targetZoom = _zoomAtSpeed;
+    }
+    
+    // 6. Clamp to safe range
+    targetZoom = targetZoom.clamp(minZoom, maxZoom);
+    
+    // 7. Smooth zoom transition using damping
+    final zoomDiff = targetZoom - _smoothZoom;
+    _zoomVelocity = _zoomVelocity * zoomSmoothDamping + zoomDiff * zoomSmoothFactor;
+    _smoothZoom = _smoothZoom + _zoomVelocity;
+    
+    _smoothZoom = _smoothZoom.clamp(minZoom, maxZoom);
+    
+    // 8. Ensure driver is always at bottom of screen (Uber style)
+    _updateMapPadding();
+    
+    return _smoothZoom;
+  }
+
+  void _updateDynamicCameraPosition() {
     if (!isCameraFollowing || mapController == null || driverLocation == null) return;
-    if (isDriverMoving || cameraTargetPosition == null) {
-      _updateCameraPosition();
+    
+    if (!isDriverMoving && cameraTargetPosition != null) {
+      return;
+    }
+    
+    final targetLat = driverLocation!.latitude;
+    final targetLng = driverLocation!.longitude;
+    
+    if (cameraTargetPosition == null) {
+      cameraTargetPosition = driverLocation;
+    }
+    
+    final deltaLat = targetLat - cameraTargetPosition!.latitude;
+    final deltaLng = targetLng - cameraTargetPosition!.longitude;
+    
+    if (deltaLat.abs() > 0.00001 || deltaLng.abs() > 0.00001) {
+      cameraTargetPosition = LatLng(
+        cameraTargetPosition!.latitude + deltaLat * 0.3,
+        cameraTargetPosition!.longitude + deltaLng * 0.3,
+      );
+    }
+    
+    // Keep bearing at 0 (North-up) - never rotate map
+    cameraBearing = 0;
+    
+    double targetZoom = _calculateDynamicZoom();
+    cameraZoom = targetZoom;
+    
+    _updateMapPadding();
+    
+    // Use throttled camera updates
+    if (_cameraThrottler != null) {
+      _cameraThrottler!.updatePosition(
+        CameraPosition(
+          target: cameraTargetPosition!,
+          zoom: cameraZoom,
+          bearing: 0, // Always North-up
+          tilt: 45.0,
+        ),
+      );
+    } else {
+      try {
+        mapController!.animateCamera(
+          CameraUpdate.newCameraPosition(
+            CameraPosition(
+              target: cameraTargetPosition!,
+              zoom: cameraZoom,
+              bearing: 0, // Always North-up
+              tilt: 45.0,
+            ),
+          ),
+        );
+      } catch (e) {
+        // Ignore - controller may be disposed
+      }
     }
   }
 
-  // ✅ FIXED: Complete _updateCameraPosition implementation
+  // ============================================================
+  // UPDATE CAMERA POSITION - Legacy method (kept for compatibility)
+  // ============================================================
   void _updateCameraPosition() {
     if (mapController == null || driverLocation == null) return;
     final targetLat = driverLocation!.latitude;
@@ -3425,27 +4108,37 @@ class DriverMapController {
         cameraTargetPosition!.longitude + deltaLng * 0.3,
       );
     }
-    double targetBearing = isMapRotating ? currentHeading : 0;
-    double bearingDiff = targetBearing - cameraBearing;
-    if (bearingDiff > 180) bearingDiff -= 360;
-    if (bearingDiff < -180) bearingDiff += 360;
-    cameraBearing += bearingDiff * 0.2;
-    double targetZoom = baseZoom;
-    if (isNearJunction) {
-      targetZoom = baseZoom + 0.5;
-    }
-    cameraZoom += (targetZoom - cameraZoom) * 0.1;
+    // Always keep North-up
+    cameraBearing = 0;
+    double targetZoom = _calculateDynamicZoom();
+    cameraZoom = targetZoom;
     _updateMapPadding();
-    mapController!.animateCamera(
-      CameraUpdate.newCameraPosition(
+    
+    if (_cameraThrottler != null) {
+      _cameraThrottler!.updatePosition(
         CameraPosition(
           target: cameraTargetPosition!,
           zoom: cameraZoom,
-          bearing: cameraBearing,
-          tilt: 60.0,
+          bearing: 0, // Always North-up
+          tilt: 45.0,
         ),
-      ),
-    );
+      );
+    } else {
+      try {
+        mapController!.animateCamera(
+          CameraUpdate.newCameraPosition(
+            CameraPosition(
+              target: cameraTargetPosition!,
+              zoom: cameraZoom,
+              bearing: 0, // Always North-up
+              tilt: 45.0,
+            ),
+          ),
+        );
+      } catch (e) {
+        // Ignore - controller may be disposed
+      }
+    }
   }
 
   void updateHeading(double heading) {
@@ -3475,18 +4168,22 @@ class DriverMapController {
   void initializeMap(GoogleMapController controller) {
     mapController = controller;
     if (driverLocation != null) {
-      controller.animateCamera(
-        CameraUpdate.newCameraPosition(
-          CameraPosition(
-            target: driverLocation!,
-            zoom: baseZoom,
-            tilt: 60.0,
-            bearing: currentHeading,
+      try {
+        controller.animateCamera(
+          CameraUpdate.newCameraPosition(
+            CameraPosition(
+              target: driverLocation!,
+              zoom: baseZoom,
+              tilt: 45.0,
+              bearing: 0, // Always North-up
+            ),
           ),
-        ),
-      );
+        );
+      } catch (e) {
+        // Ignore
+      }
     }
-    isMapRotating = true;
+    isMapRotating = false; // Keep North-up always
     isCameraFollowing = true;
     startCameraFollowing();
     initializeAnimationUpdates();
@@ -3498,12 +4195,16 @@ class DriverMapController {
     if (customerLocation != null) points.add(customerLocation!);
     if (driverLocation != null) points.add(driverLocation!);
     final bounds = getBoundsFromPoints(points);
-    mapController!.animateCamera(
-      CameraUpdate.newLatLngBounds(
-        bounds,
-        60,
-      ),
-    );
+    try {
+      mapController!.animateCamera(
+        CameraUpdate.newLatLngBounds(
+          bounds,
+          60,
+        ),
+      );
+    } catch (e) {
+      // Ignore
+    }
   }
 
   // ============================================================
@@ -3615,9 +4316,6 @@ class DriverMapController {
       String baseUrl = 'https://roads.googleapis.com/v1/speedLimits?path=${position.latitude},${position.longitude}'
           '&key=$googleAPIKey';
       String url = baseUrl;
-      if (useCorsProxy) {
-        url = '$corsProxyUrl$baseUrl';
-      }
       final response = await http.get(Uri.parse(url));
       if (response.statusCode == 200) {
         final data = jsonDecode(response.body);
@@ -3652,9 +4350,6 @@ class DriverMapController {
           '&interpolate=true'
           '&key=$googleAPIKey';
       String url = baseUrl;
-      if (useCorsProxy) {
-        url = '$corsProxyUrl$baseUrl';
-      }
       final response = await http.get(Uri.parse(url));
       if (response.statusCode == 200) {
         final data = jsonDecode(response.body);
@@ -3754,12 +4449,16 @@ class DriverMapController {
   // ============================================================
   void zoomToRoute() {
     if (mapController == null || currentRoutePoints.isEmpty) return;
-    mapController!.animateCamera(
-      CameraUpdate.newLatLngBounds(
-        getBoundsFromPoints(currentRoutePoints),
-        50,
-      ),
-    );
+    try {
+      mapController!.animateCamera(
+        CameraUpdate.newLatLngBounds(
+          getBoundsFromPoints(currentRoutePoints),
+          50,
+        ),
+      );
+    } catch (e) {
+      // Ignore
+    }
   }
 
   // ============================================================
@@ -3878,7 +4577,7 @@ class DriverMapController {
   }
 
   void setMapRotation(bool enabled) {
-    isMapRotating = enabled;
+    isMapRotating = false; // Always keep North-up
   }
 
   bool isMoving() {
@@ -3951,8 +4650,8 @@ class DriverMapController {
 
   Map<String, dynamic> getCorsConfig() {
     return {
-      'useProxy': useCorsProxy,
-      'proxyUrl': corsProxyUrl,
+      'useProxy': false, // Now using direct API calls
+      'proxyUrl': '', // CORS proxy not used anymore
       'isWeb': const bool.fromEnvironment('dart.library.js_util'),
     };
   }
@@ -4170,7 +4869,36 @@ class DriverMapController {
   }
 
   // ============================================================
-  // DISPOSE - Comprehensive cleanup
+  // PERFORMANCE LOGGING
+  // ============================================================
+  Map<String, dynamic> getPerformanceStats() {
+    return {
+      'markers': {
+        'total': mapMarkers.length + animatedMarkers.length,
+        'cached': markerCache.length,
+        'poolSize': _markerPool.size,
+      },
+      'route': {
+        'points': currentRoutePoints.length,
+        'steps': routeSteps.length,
+        'alternatives': alternativeRoutes.length,
+      },
+      'firestore': {
+        'batchSize': _batchManager._batch.length,
+        'lastUpdate': lastFirestoreUpdateTime?.toIso8601String(),
+        'isQueued': isFirestoreUpdateQueued,
+      },
+      'performance': _performanceMetrics.map((k, v) => MapEntry(k, '${v.inMilliseconds}ms')),
+      'memory': {
+        'errorLogs': _errorLogs.length,
+        'headingHistory': headingHistory.length,
+        'recentPositions': recentPositions.length,
+      },
+    };
+  }
+
+  // ============================================================
+  // DISPOSE - Comprehensive cleanup (FIXED: Removed mapController.dispose)
   // ============================================================
   void dispose() {
     _logInfo('Disposing DriverMapController...');
@@ -4208,7 +4936,19 @@ class DriverMapController {
     _animationUpdateTimer?.cancel();
     _animationUpdateTimer = null;
     
-    // ✅ Cancel arrival listener on dispose
+    // Clean up camera throttler
+    _cameraThrottler?.dispose();
+    _cameraThrottler = null;
+    
+    // Flush and dispose batch manager
+    _batchManager.flush();
+    _batchManager.dispose();
+    
+    // Clear lazy step loader
+    _lazyStepLoader?.clear();
+    _lazyStepLoader = null;
+    
+    // Cancel arrival listener on dispose
     _arrivalCheckTimer?.cancel();
     _arrivalCheckTimer = null;
 
@@ -4239,12 +4979,8 @@ class DriverMapController {
       // Ignore
     }
 
-    try {
-      _tts?.stop();
-      _tts = null;
-    } catch (e) {
-      // Ignore
-    }
+    // Dispose TTS
+    _ttsManager.dispose();
 
     mapMarkers.clear();
     animatedMarkers.clear();
@@ -4266,6 +5002,7 @@ class DriverMapController {
     _performanceTimers.clear();
     _performanceMetrics.clear();
     _errorLogs.clear();
+    _markerPool.clear();
 
     _isSessionActive = false;
     _navigationInitialized = false;
@@ -4276,11 +5013,9 @@ class DriverMapController {
     hasArrived = false;
     isRecalculatingRoute = false;
 
-    try {
-      mapController?.dispose();
-    } catch (e) {
-      // Ignore
-    }
+    // IMPORTANT: Do NOT call mapController?.dispose()
+    // GoogleMapController does not have a dispose method and is managed by the plugin
+    // Just set to null to release reference
     mapController = null;
 
     _logInfo('🗺️ DriverMapController disposed successfully');

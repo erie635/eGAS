@@ -1,6 +1,7 @@
 // ============================================================
 // FILE: lib/features/home/home_map_controller.dart
-// COMPLETE - FIXED WITH ARRIVAL LISTENER AND FIXED ONTIMEOUT
+// COMPLETE - WITH FIREBASE-TRIGGERED NAVIGATION + FIXED ACCEPTANCE CHECK + SINGLE ARRIVAL ANNOUNCEMENT
+// CLIENT-FOCUSED VOICE ANNOUNCEMENTS
 // ============================================================
 
 import 'package:flutter/material.dart';
@@ -87,7 +88,7 @@ class NavigationStep {
 }
 
 // ============================================================
-// HOME MAP CONTROLLER 
+// HOME MAP CONTROLLER - COMPLETE WITH REALTIME OPTIMIZATIONS
 // ============================================================
 class HomeMapController extends ChangeNotifier {
   // ============================================================
@@ -131,6 +132,18 @@ class HomeMapController extends ChangeNotifier {
   final Map<String, BitmapDescriptor> fuelImageCache = {};
   
   // ============================================================
+  // REALTIME OPTIMIZATION: Connection & Performance
+  // ============================================================
+  bool _isConnectionFast = true;
+  Timer? _connectionQualityTimer;
+  Timer? _realtimePingTimer;
+  StreamSubscription<DocumentSnapshot>? _realtimeDriverSubscription;
+  bool _isNearDestination = false;
+  Timer? _priorityUpdateTimer;
+  List<double> _speedHistory = [];
+  int _etaUpdateCounter = 0;
+  
+  // ============================================================
   // NAVIGATION STATE GUARD
   // ============================================================
   bool _navigationInitialized = false;
@@ -138,9 +151,14 @@ class HomeMapController extends ChangeNotifier {
   bool _isInitializingNavigation = false;
   
   // ============================================================
-  // ✅ ADDED: Arrival listener timer to stop route refreshing
+  // ADDED: Arrival listener timer to stop route refreshing
   // ============================================================
   Timer? _arrivalCheckTimer;
+  
+  // ============================================================
+  // ADDED: Flag to ensure arrival is announced only once
+  // ============================================================
+  bool _arrivalAnnounced = false;
   
   // ============================================================
   // GPS FILTERING
@@ -219,26 +237,26 @@ class HomeMapController extends ChangeNotifier {
   List<double> _stepDistances = [];
   
   // ============================================================
-  // CAMERA FOLLOWING
+  // CAMERA FOLLOWING - ADJUSTED FOR CLOSER VIEW
   // ============================================================
   Timer? cameraFollowTimer;
   bool isCameraFollowing = true;
   bool isMapRotating = true;
   LatLng? cameraTargetPosition;
   double cameraBearing = 0;
-  double cameraZoom = 16.0;
-  static const double baseZoom = 16.0;
-  double minZoom = 14.0;
-  double maxZoom = 18.0;
+  double cameraZoom = 18.0;
+  static const double baseZoom = 18.0;
+  double minZoom = 15.0;
+  double maxZoom = 20.0;
   
-  double _smoothZoom = 16.0;
+  double _smoothZoom = 18.0;
   double _zoomVelocity = 0.0;
   static const double zoomSmoothFactor = 0.15;
   static const double zoomSmoothDamping = 0.85;
   
-  double _zoomAtSpeed = 16.0;
-  double _zoomAtJunction = 16.0;
-  double _zoomAtArrival = 16.0;
+  double _zoomAtSpeed = 18.0;
+  double _zoomAtJunction = 18.0;
+  double _zoomAtArrival = 18.0;
   bool _wasNearJunction = false;
   
   LatLng? lastKnownPosition;
@@ -260,10 +278,10 @@ class HomeMapController extends ChangeNotifier {
   double screenWidth = 0;
 
   // ============================================================
-  // CAR SIZE
+  // CAR SIZE - INCREASED FOR BETTER VISIBILITY
   // ============================================================
-  double carMarkerWidth = 80.0;
-  double carMarkerHeight = 120.0;
+  double carMarkerWidth = 120.0;
+  double carMarkerHeight = 160.0;
 
   // ============================================================
   // FUEL OPTIONS
@@ -407,7 +425,7 @@ class HomeMapController extends ChangeNotifier {
   BuildContext? _context;
 
   // ============================================================
-  // TTS (Text-to-Speech)
+  // TTS (Text-to-Speech) - CLIENT FOCUSED
   // ============================================================
   FlutterTts? _tts;
   bool isVoiceEnabled = true;
@@ -450,6 +468,18 @@ class HomeMapController extends ChangeNotifier {
   static const int _movementUpdateIntervalMs = 50;
   
   // ============================================================
+  // ORDER STATUS TRACKING - FIX FOR REAL-TIME UPDATES
+  // ============================================================
+  String _orderStatus = 'pending'; // pending, accepted, en_route, arrived, completed, cancelled
+  bool _hasOrderBeenAccepted = false;
+  bool _hasOrderBeenCompleted = false;
+  
+  // ============================================================
+  // SAFETY GUARD - PREVENT NOTIFY AFTER DISPOSAL
+  // ============================================================
+  bool _disposed = false;
+  
+  // ============================================================
   // CONSTRUCTOR
   // ============================================================
   HomeMapController() {
@@ -460,10 +490,24 @@ class HomeMapController extends ChangeNotifier {
     _startGpsAccuracyMonitoring();
     _startEnvironmentDetection();
     _setupPerformanceOptimization();
+    // 🔥 Initialize realtime optimizations
+    _enableRealtimeDriverTracking();
+    _monitorConnectionQuality();
+    _speedHistory = [];
   }
 
   void setContext(BuildContext context) {
     _context = context;
+  }
+
+  // ============================================================
+  // SAFE NOTIFY LISTENERS - PREVENT CALLS AFTER DISPOSAL
+  // ============================================================
+  @override
+  void notifyListeners() {
+    if (!_disposed) {
+      super.notifyListeners();
+    }
   }
 
   // ============================================================
@@ -509,6 +553,251 @@ class HomeMapController extends ChangeNotifier {
   void setVoiceEnabled(bool enabled) {
     isVoiceEnabled = enabled;
     notifyListeners();
+  }
+
+  // ============================================================
+  // GET ORDER STATUS - PUBLIC GETTER
+  // ============================================================
+  String getOrderStatus() => _orderStatus;
+  bool isOrderAcceptedStatus() => _orderStatus == 'accepted' || _orderStatus == 'en_route' || _orderStatus == 'arrived';
+  bool isOrderCompleted() => _orderStatus == 'completed' || _orderStatus == 'cancelled';
+  bool isWaitingForDriver() => _orderStatus == 'pending' || _orderStatus == 'finding_driver';
+
+  // ============================================================
+  // REALTIME OPTIMIZATION: Enable Realtime Driver Tracking
+  // ============================================================
+  void _enableRealtimeDriverTracking() {
+    if (activeDriverId == null) return;
+    
+    _realtimeDriverSubscription?.cancel();
+    
+    _realtimeDriverSubscription = FirebaseFirestore.instance
+        .collection('drivers')
+        .doc(activeDriverId)
+        .snapshots(includeMetadataChanges: true)
+        .listen((snapshot) {
+          if (!snapshot.exists) return;
+          
+          final data = snapshot.data() as Map<String, dynamic>;
+          final lat = (data['lat'] ?? 0).toDouble();
+          final lng = (data['lng'] ?? 0).toDouble();
+          
+          if (lat == 0 && lng == 0) return;
+          
+          // Process update IMMEDIATELY
+          _processRealtimeDriverUpdate(LatLng(lat, lng), data);
+        }, onError: (error) {
+          print('⚠️ Realtime driver tracking error: $error');
+          // Fallback to polling
+          _enablePollingFallback();
+        });
+  }
+
+  void _processRealtimeDriverUpdate(LatLng position, Map<String, dynamic> data) {
+    // Update position immediately
+    startInterpolation(position);
+    
+    // Update speed
+    currentSpeed = (data['speed'] ?? 0.0).toDouble();
+    
+    // Update bearing
+    if (previousDriverPosition != null) {
+      final bearing = _calculateBearing(previousDriverPosition!, position);
+      if (filteredBearing == 0) {
+        filteredBearing = bearing;
+      } else {
+        filteredBearing = filteredBearing * 0.7 + bearing * 0.3;
+      }
+      currentDriverBearing = bearing;
+    }
+    previousDriverPosition = position;
+    
+    // Update active driver location
+    activeDriverLocation = {
+      'lat': position.latitude,
+      'lng': position.longitude,
+      'name': data['name'] ?? 'Driver',
+      'vehicleType': data['vehicleType'] ?? 'medium',
+      'numberPlate': data['numberPlate'] ?? 'N/A',
+      'photoUrl': data['photoUrl'] ?? '',
+      'phone': data['phone'] ?? 'N/A',
+    };
+    driverPhotoUrl = data['photoUrl'] ?? '';
+    driverPhoneNumber = data['phone'] ?? 'N/A';
+    
+    // Update distance
+    if (currentPosition != null) {
+      distanceToDriver = Geolocator.distanceBetween(
+        currentPosition!.latitude,
+        currentPosition!.longitude,
+        position.latitude,
+        position.longitude,
+      );
+      
+      // Enable priority updates when close
+      _enablePriorityUpdates(distanceToDriver!);
+      
+      // Update ETA
+      _updateETA(distanceToDriver!);
+      
+      // Update status
+      _updateDriverStatus(distanceToDriver!);
+      
+      // Redraw route if needed
+      if (!hasArrived && currentRoutePoints.isEmpty) {
+        drawDriverRoute(position.latitude, position.longitude);
+      }
+      
+      // Recalculate route if off-route
+      if (!hasArrived) {
+        _recalculateRouteIfNeeded(position);
+      }
+    }
+    
+    notifyListeners();
+  }
+
+  // ============================================================
+  // REALTIME OPTIMIZATION: Connection Quality Monitoring
+  // ============================================================
+  void _monitorConnectionQuality() {
+    _connectionQualityTimer?.cancel();
+    _connectionQualityTimer = Timer.periodic(const Duration(seconds: 5), (timer) {
+      _checkConnectionSpeed();
+    });
+  }
+
+  Future<void> _checkConnectionSpeed() async {
+    try {
+      final stopwatch = Stopwatch()..start();
+      await FirebaseFirestore.instance.collection('drivers').limit(1).get();
+      stopwatch.stop();
+      
+      final latency = stopwatch.elapsedMilliseconds;
+      _isConnectionFast = latency < 500;
+      
+      if (!_isConnectionFast) {
+        print('⚠️ Slow connection detected: ${latency}ms');
+        _enablePollingFallback();
+      } else {
+        // If connection is fast, use realtime
+        if (_realtimePingTimer != null) {
+          _realtimePingTimer?.cancel();
+          _realtimePingTimer = null;
+          _enableRealtimeDriverTracking();
+        }
+      }
+    } catch (e) {
+      _isConnectionFast = false;
+      _enablePollingFallback();
+    }
+  }
+
+  void _enablePollingFallback() {
+    // If WebSocket/Realtime is slow, fallback to polling
+    _realtimePingTimer?.cancel();
+    _realtimePingTimer = Timer.periodic(const Duration(seconds: 2), (timer) {
+      if (activeDriverId != null) {
+        _fetchDriverLocationManual();
+      }
+    });
+    print('🔄 Fallback to polling mode enabled');
+  }
+
+  Future<void> _fetchDriverLocationManual() async {
+    try {
+      final doc = await FirebaseFirestore.instance
+          .collection('drivers')
+          .doc(activeDriverId)
+          .get();
+      
+      if (doc.exists) {
+        final data = doc.data() as Map<String, dynamic>;
+        final lat = (data['lat'] ?? 0).toDouble();
+        final lng = (data['lng'] ?? 0).toDouble();
+        
+        if (lat != 0 && lng != 0) {
+          _processRealtimeDriverUpdate(LatLng(lat, lng), data);
+        }
+      }
+    } catch (e) {
+      print('Manual fetch error: $e');
+    }
+  }
+
+  // ============================================================
+  // REALTIME OPTIMIZATION: Priority Updates Near Arrival
+  // ============================================================
+  void _enablePriorityUpdates(double distance) {
+    // When driver is close (< 500m), increase update frequency
+    if (distance < 500 && !_isNearDestination) {
+      _isNearDestination = true;
+      _priorityUpdateTimer?.cancel();
+      _priorityUpdateTimer = Timer.periodic(const Duration(milliseconds: 500), (timer) {
+        if (activeDriverId != null && currentPosition != null) {
+          _fetchDriverLocationManual();
+        }
+      });
+      print('🚀 Priority updates enabled - driver is near!');
+    } else if (distance > 1000 && _isNearDestination) {
+      _isNearDestination = false;
+      _priorityUpdateTimer?.cancel();
+      _priorityUpdateTimer = null;
+      print('🔄 Priority updates disabled - driver moved away');
+    }
+  }
+
+  // ============================================================
+  // REALTIME OPTIMIZATION: ETA Calculation with Moving Average
+  // ============================================================
+  void _updateETA(double distanceInMeters) {
+    // Only update ETA every 3 updates to avoid flickering
+    _etaUpdateCounter++;
+    if (_etaUpdateCounter % 3 != 0) return;
+    
+    double speedKmh = currentSpeed * 3.6; // m/s to km/h
+    
+    // Use moving average for speed
+    if (speedKmh > 1) {
+      _speedHistory.add(speedKmh);
+      if (_speedHistory.length > 5) _speedHistory.removeAt(0);
+    }
+    
+    double avgSpeed = _speedHistory.isNotEmpty 
+        ? _speedHistory.reduce((a, b) => a + b) / _speedHistory.length 
+        : 20.0;
+    
+    // Calculate ETA
+    double distanceKm = distanceInMeters / 1000;
+    double timeHours = distanceKm / (avgSpeed > 5 ? avgSpeed : 20);
+    int minutes = (timeHours * 60).ceil().clamp(1, 60);
+    
+    estimatedMinutes = minutes;
+    destinationEtaMinutes = minutes;
+    
+    // Update distance text
+    destinationDistanceText = _formatDistance(distanceInMeters);
+    
+    notifyListeners();
+  }
+
+  // ============================================================
+  // REALTIME OPTIMIZATION: Force Refresh
+  // ============================================================
+  void forceRefreshPosition() {
+    if (activeDriverId != null) {
+      print('🔄 Force refreshing driver position...');
+      _fetchDriverLocationManual();
+      
+      // Also refresh route
+      if (activeDriverLocation != null && currentPosition != null) {
+        final lat = activeDriverLocation!['lat'] ?? 0;
+        final lng = activeDriverLocation!['lng'] ?? 0;
+        if (lat != 0 && lng != 0) {
+          drawDriverRoute(lat, lng);
+        }
+      }
+    }
   }
 
   // ============================================================
@@ -730,6 +1019,12 @@ class HomeMapController extends ChangeNotifier {
   }
 
   String getDeliveryStatus() {
+    // Check order status first
+    if (_orderStatus == 'completed') return '✅ Delivered!';
+    if (_orderStatus == 'cancelled') return '❌ Cancelled';
+    if (_orderStatus == 'arrived') return '📍 Driver Arrived!';
+    
+    // Then check progress
     final progress = getDeliveryProgress();
     
     if (hasArrived) return '✅ Delivered!';
@@ -738,10 +1033,15 @@ class HomeMapController extends ChangeNotifier {
     if (progress >= 0.50) return '🛣️ En Route';
     if (progress >= 0.25) return '🚚 On The Way';
     if (progress >= 0.10) return '⏳ Heading Your Way';
-    return '⏳ Waiting for Driver';
+    return '⏳ Finding your driver...';
   }
 
   Color getDeliveryStatusColor() {
+    // Check order status first
+    if (_orderStatus == 'completed' || _orderStatus == 'arrived') return Colors.green;
+    if (_orderStatus == 'cancelled') return Colors.red;
+    if (_orderStatus == 'accepted') return Colors.blue;
+    
     final progress = getDeliveryProgress();
     
     if (hasArrived) return Colors.green;
@@ -804,28 +1104,29 @@ class HomeMapController extends ChangeNotifier {
   }
 
   // ============================================================
-  // Voice Announcements for Navigation - ENHANCED
+  // CLIENT-FOCUSED VOICE ANNOUNCEMENTS
   // ============================================================
-  void announceTurn(String maneuver, double distance) {
+  void announceTurn(String maneuver, double distance, String roadName) {
     if (!isVoiceEnabled) return;
     
     final maneuverText = _getManeuverText(maneuver);
+    final roadText = roadName.isNotEmpty ? ' on $roadName' : '';
     String announcement;
     
     if (distance < 30) {
-      announcement = '$maneuverText now!';
+      announcement = 'Your driver is $maneuverText now$roadText';
     } else if (distance < 50) {
-      announcement = 'In 50 meters, $maneuverText';
+      announcement = 'In 50 meters, your driver will $maneuverText$roadText';
     } else if (distance < 100) {
-      announcement = 'In 100 meters, $maneuverText';
+      announcement = 'In 100 meters, your driver will $maneuverText$roadText';
     } else if (distance < 200) {
-      announcement = 'In 200 meters, $maneuverText';
+      announcement = 'In 200 meters, your driver will $maneuverText$roadText';
     } else if (distance < 500) {
-      announcement = 'In 500 meters, $maneuverText';
+      announcement = 'In 500 meters, your driver will $maneuverText$roadText';
     } else if (distance < 1000) {
-      announcement = 'In 1 kilometer, $maneuverText';
+      announcement = 'In 1 kilometer, your driver will $maneuverText$roadText';
     } else {
-      announcement = 'In ${_formatDistance(distance)}, $maneuverText';
+      announcement = 'In ${_formatDistance(distance)}, your driver will $maneuverText$roadText';
     }
     
     speak(announcement);
@@ -1154,12 +1455,17 @@ class HomeMapController extends ChangeNotifier {
   }
 
   // ============================================================
-  // INITIALIZATION - FIXED: Added missing _getCurrentLocation call
+  // INITIALIZATION - COMPLETE WITH REALTIME OPTIMIZATIONS
   // ============================================================
   void _init() {
     _getCurrentLocation();
     _checkActiveOrder();
     _listenToDriversRealtime();
+    
+    // 🔥 REALTIME OPTIMIZATIONS
+    _enableRealtimeDriverTracking();
+    _monitorConnectionQuality();
+    _speedHistory = [];
     
     refreshTimer = Timer.periodic(const Duration(seconds: 10), (timer) {
       if (isMapReady && !showFuelSelector) _loadNearbyDrivers();
@@ -1178,32 +1484,85 @@ class HomeMapController extends ChangeNotifier {
     _testGoogleMapsAPI();
   }
 
+  // ============================================================
+  // DISPOSE - ENHANCED WITH SAFETY GUARDS
+  // ============================================================
   void dispose() {
+    if (_disposed) return;
+    _disposed = true;
+    
     refreshTimer?.cancel();
+    refreshTimer = null;
     orderStatusSubscription?.cancel();
+    orderStatusSubscription = null;
     driverLocationSubscription?.cancel();
+    driverLocationSubscription = null;
     driverStreamSubscription?.cancel();
+    driverStreamSubscription = null;
     driverMovementTimer?.cancel();
+    driverMovementTimer = null;
     interpolationTimer?.cancel();
+    interpolationTimer = null;
     routeRecalculationTimer?.cancel();
+    routeRecalculationTimer = null;
     turnAlertTimer?.cancel();
+    turnAlertTimer = null;
     cameraFollowTimer?.cancel();
+    cameraFollowTimer = null;
     movementCheckTimer?.cancel();
+    movementCheckTimer = null;
     trafficRerouteTimer?.cancel();
+    trafficRerouteTimer = null;
     speedCheckTimer?.cancel();
+    speedCheckTimer = null;
     _backgroundUpdateTimer?.cancel();
+    _backgroundUpdateTimer = null;
     voiceDebounceTimer?.cancel();
+    voiceDebounceTimer = null;
     voiceAnnouncementTimer?.cancel();
+    voiceAnnouncementTimer = null;
     _roadSnappingTimer?.cancel();
+    _roadSnappingTimer = null;
     _errorRetryTimer?.cancel();
+    _errorRetryTimer = null;
     _gpsAccuracyTimer?.cancel();
+    _gpsAccuracyTimer = null;
     _environmentDetectionTimer?.cancel();
+    _environmentDetectionTimer = null;
     _performanceTimer?.cancel();
-    // ✅ Cancel arrival listener on dispose
+    _performanceTimer = null;
+    
+    // 🔥 Cancel realtime timers
+    _realtimeDriverSubscription?.cancel();
+    _realtimeDriverSubscription = null;
+    _realtimePingTimer?.cancel();
+    _realtimePingTimer = null;
+    _connectionQualityTimer?.cancel();
+    _connectionQualityTimer = null;
+    _priorityUpdateTimer?.cancel();
+    _priorityUpdateTimer = null;
+    
+    // Cancel arrival listener on dispose
     _arrivalCheckTimer?.cancel();
     _arrivalCheckTimer = null;
-    mapController?.dispose();
-    _tts?.stop();
+    
+    // Dispose map controller safely
+    try {
+      mapController?.dispose();
+    } catch (e) {
+      print('⚠️ Error disposing map controller: $e');
+    }
+    mapController = null;
+    
+    // Stop TTS
+    try {
+      _tts?.stop();
+    } catch (e) {
+      // Ignore
+    }
+    _tts = null;
+    
+    super.dispose();
   }
 
   // ============================================================
@@ -1228,7 +1587,7 @@ class HomeMapController extends ChangeNotifier {
   }
 
   // ============================================================
-  // ENHANCED CAMERA FOLLOWING WITH DYNAMIC ZOOM
+  // ENHANCED CAMERA FOLLOWING WITH DYNAMIC ZOOM - UPDATED FOR CLOSER VIEW
   // ============================================================
   void startUberCameraFollowing() {
     cameraFollowTimer?.cancel();
@@ -1274,42 +1633,42 @@ class HomeMapController extends ChangeNotifier {
   }
   
   // ============================================================
-  // ENHANCED ZOOM CALCULATION - SMOOTH & DYNAMIC
+  // ENHANCED ZOOM CALCULATION - KEEPS MAP CLOSE TO DRIVER
   // ============================================================
   double _calculateUberZoom() {
     double targetZoom = baseZoom;
     
-    // 1. Speed-based zoom
+    // 1. Speed-based zoom - maintain closer view at all speeds
     if (currentSpeed < 5) {
-      _zoomAtSpeed = 17.5;
+      _zoomAtSpeed = 19.5;
     } else if (currentSpeed < 10) {
-      _zoomAtSpeed = 17.0;
+      _zoomAtSpeed = 19.0;
     } else if (currentSpeed < 20) {
-      _zoomAtSpeed = 16.5;
+      _zoomAtSpeed = 18.5;
     } else if (currentSpeed < 35) {
-      _zoomAtSpeed = 16.0;
+      _zoomAtSpeed = 18.0;
     } else if (currentSpeed < 50) {
-      _zoomAtSpeed = 15.5;
+      _zoomAtSpeed = 17.5;
     } else if (currentSpeed < 70) {
-      _zoomAtSpeed = 15.0;
+      _zoomAtSpeed = 17.0;
     } else {
-      _zoomAtSpeed = 14.5;
+      _zoomAtSpeed = 16.5;
     }
     
-    // 2. Junction proximity zoom
+    // 2. Junction proximity zoom - get even closer at turns
     if (isNearJunction && junctionDistance < 100) {
-      _zoomAtJunction = 18.0;
+      _zoomAtJunction = 20.0;
     } else if (isNearJunction && junctionDistance < 200) {
-      _zoomAtJunction = 17.5;
+      _zoomAtJunction = 19.5;
     } else {
       _zoomAtJunction = _zoomAtSpeed;
     }
     
-    // 3. Arrival zoom
+    // 3. Arrival zoom - maximum zoom when arriving
     if (hasArrived || (distanceToDriver != null && distanceToDriver! < 100)) {
-      _zoomAtArrival = 18.5;
+      _zoomAtArrival = 20.0;
     } else if (distanceToDriver != null && distanceToDriver! < 500) {
-      _zoomAtArrival = 18.0;
+      _zoomAtArrival = 19.5;
     } else {
       _zoomAtArrival = _zoomAtJunction;
     }
@@ -1570,7 +1929,7 @@ class HomeMapController extends ChangeNotifier {
   }
 
   // ============================================================
-  // VEHICLE MARKER
+  // VEHICLE MARKER - INCREASED SIZE FOR BETTER VISIBILITY
   // ============================================================
   Future<BitmapDescriptor> getVehicleMarker(String vehicleType, {double bearing = 0}) async {
     final int width = carMarkerWidth.toInt();
@@ -1624,7 +1983,7 @@ class HomeMapController extends ChangeNotifier {
       }
     }
     
-    const String defaultKey = 'default_car_60_60';
+    const String defaultKey = 'default_car_140_200';
     if (markerCache.containsKey(defaultKey)) return markerCache[defaultKey]!;
     
     try {
@@ -1752,7 +2111,7 @@ class HomeMapController extends ChangeNotifier {
   }
 
   // ============================================================
-  // DRIVER LOCATION LISTENING
+  // DRIVER LOCATION LISTENING - ENHANCED WITH REALTIME
   // ============================================================
   void _listenToDriverLocation() {
     driverLocationSubscription?.cancel();
@@ -1765,6 +2124,9 @@ class HomeMapController extends ChangeNotifier {
     print('📍 Driver confirmed! Starting Uber-style tracking...');
     
     startBackgroundLocationUpdates();
+    
+    // 🔥 Use realtime driver tracking
+    _enableRealtimeDriverTracking();
     
     driverLocationSubscription = FirebaseFirestore.instance
         .collection('drivers')
@@ -1838,34 +2200,11 @@ class HomeMapController extends ChangeNotifier {
             distanceToDriver = distanceInMeters;
             distanceToDestination = distanceInMeters;
             
-            if (!useActualEta) {
-              double speedFactor = distanceInMeters < 500 ? 0.8 : 
-                                   distanceInMeters < 2000 ? 1.0 : 
-                                   distanceInMeters < 5000 ? 1.2 : 1.5;
-              double minutes = (distanceInMeters / 1000) / (driverSpeedKmh * speedFactor) * 60;
-              estimatedMinutes = minutes.ceil().clamp(1, 60);
-              destinationEtaMinutes = estimatedMinutes!;
-              destinationDistanceText = _formatDistance(distanceInMeters);
-            }
+            // 🔥 Use optimized ETA
+            _updateETA(distanceInMeters);
             
-            if (distanceInMeters < 200) {
-              driverStatusText = '📍 Almost There!';
-              if (!hasDriverArrived) {
-                hasDriverArrived = true;
-                driverArrivalTime = DateTime.now();
-                speak('Your driver is almost there!');
-              }
-            } else if (distanceInMeters < 500) {
-              driverStatusText = '🚗 Very Close!';
-              hasDriverArrived = false;
-            } else if (distanceInMeters < 1000) {
-              driverStatusText = '🛣️ Getting Close';
-              hasDriverArrived = false;
-            } else {
-              driverStatusText = '🚚 En Route';
-              hasDriverArrived = false;
-            }
-            notifyListeners();
+            // Update status
+            _updateDriverStatus(distanceInMeters);
             
             if (currentRoutePoints.isEmpty || lastRouteDestination == null || 
                 lastRouteDestination!.latitude != currentPosition!.latitude ||
@@ -1878,6 +2217,49 @@ class HomeMapController extends ChangeNotifier {
   }
 
   // ============================================================
+  // UPDATE DRIVER STATUS - CLIENT-FOCUSED
+  // ============================================================
+  void _updateDriverStatus(double distanceInMeters) {
+    // Only update status if order has been accepted
+    if (_hasOrderBeenAccepted) {
+      if (distanceInMeters < 200) {
+        driverStatusText = '📍 Your driver is almost here!';
+        _orderStatus = 'arrived';
+        if (!hasDriverArrived) {
+          hasDriverArrived = true;
+          driverArrivalTime = DateTime.now();
+          // 🔥 CLIENT-FOCUSED: "Your driver has arrived" not "You have arrived"
+          if (_navigationInitialized && !_arrivalAnnounced) {
+            _arrivalAnnounced = true;
+            speak('Your driver has arrived at your location!');
+          }
+        }
+      } else if (distanceInMeters < 500) {
+        driverStatusText = '🚗 Your driver is very close!';
+        _orderStatus = 'en_route';
+        hasDriverArrived = false;
+        // Reset arrival announcement flag when driver moves away
+        _arrivalAnnounced = false;
+      } else if (distanceInMeters < 1000) {
+        driverStatusText = '🛣️ Your driver is getting close';
+        _orderStatus = 'en_route';
+        hasDriverArrived = false;
+        _arrivalAnnounced = false;
+      } else {
+        driverStatusText = '🚚 Your driver is on the way';
+        _orderStatus = 'en_route';
+        hasDriverArrived = false;
+        _arrivalAnnounced = false;
+      }
+    } else {
+      // Order not accepted yet - show waiting status
+      driverStatusText = '⏳ Finding your driver...';
+      _orderStatus = 'finding_driver';
+    }
+    notifyListeners();
+  }
+
+  // ============================================================
   // DRAW ROUTE WITH POLYLINE - ENHANCED WITH ARRIVAL CHECK
   // ============================================================
   Future<void> drawDriverRoute(double driverLat, double driverLng) async {
@@ -1887,7 +2269,7 @@ class HomeMapController extends ChangeNotifier {
       return;
     }
 
-    // ✅ If arrived, don't draw new route
+    // If arrived, don't draw new route
     if (hasArrived) {
       print('✅ Already arrived - skipping route draw');
       return;
@@ -1951,7 +2333,7 @@ class HomeMapController extends ChangeNotifier {
       startUberCameraFollowing();
       _isRouteFetching = false;
       
-      // ✅ Start arrival listener after route is drawn
+      // Start arrival listener after route is drawn
       _startArrivalListener();
       
     } catch (e) {
@@ -1961,7 +2343,7 @@ class HomeMapController extends ChangeNotifier {
   }
 
   // ============================================================
-  // ✅ ADDED: Arrival Listener to stop route refresh
+  // ADDED: Arrival Listener to stop route refresh
   // ============================================================
   void _startArrivalListener() {
     // Cancel any existing timer
@@ -1996,6 +2378,7 @@ class HomeMapController extends ChangeNotifier {
           _arrivalCheckTimer = null;
           // Mark as arrived to stop all route refreshes
           hasArrived = true;
+          _orderStatus = 'arrived';
           // Stop all route recalculation
           routeRecalculationTimer?.cancel();
           routeRecalculationTimer = null;
@@ -2333,7 +2716,7 @@ class HomeMapController extends ChangeNotifier {
   }
 
   // ============================================================
-  // TURN-BY-TURN NAVIGATION WITH INITIALIZATION GUARD
+  // TURN-BY-TURN NAVIGATION WITH CLIENT-FOCUSED ANNOUNCEMENTS
   // ============================================================
   void initializeTurnByTurnNavigation() {
     if (_navigationInitialized && isNavigating) {
@@ -2372,12 +2755,12 @@ class HomeMapController extends ChangeNotifier {
       final firstStep = routeSteps[0];
       _updateBannerWithStep(firstStep);
       
+      // CLIENT-FOCUSED: Tell the client their driver is starting
       if (!_hasAnnouncedStartingNavigation) {
         _hasAnnouncedStartingNavigation = true;
-        speak('Starting navigation. ${firstStep.instruction}');
-        print('✅ "Starting navigation" spoken once');
-      } else {
-        speak(firstStep.instruction);
+        final driverName = activeDriverLocation?['name'] ?? 'Your driver';
+        speak('$driverName has started heading to your location.');
+        print('✅ "Your driver has started heading to your location" spoken once');
       }
     }
     
@@ -2405,7 +2788,9 @@ class HomeMapController extends ChangeNotifier {
     routeSteps = [];
     showNavigationBanner = false;
     turnAlertTimer?.cancel();
-    // ✅ Cancel arrival listener on reset
+    // Reset arrival announcement flag
+    _arrivalAnnounced = false;
+    // Cancel arrival listener on reset
     _arrivalCheckTimer?.cancel();
     _arrivalCheckTimer = null;
     print('🔄 Navigation state reset');
@@ -2441,8 +2826,11 @@ class HomeMapController extends ChangeNotifier {
     }
   }
 
+  // ============================================================
+  // CHECK TURN ALERTS - CLIENT-FOCUSED
+  // ============================================================
   void _checkTurnAlerts() {
-    // ✅ If arrived, skip turn alerts
+    // If arrived, skip turn alerts
     if (hasArrived) return;
     
     if (currentPosition == null || routeSteps.isEmpty || currentStepIndex >= routeSteps.length) return;
@@ -2483,18 +2871,20 @@ class HomeMapController extends ChangeNotifier {
     notifyListeners();
     
     if (isNavigating && _navigationInitialized) {
+      // CLIENT-FOCUSED: Announce turns with "your driver"
+      final roadName = currentStep.roadName;
       if (distanceToStepEnd < 30 && distanceToStepEnd > 20) {
-        announceTurn(currentStep.maneuver, distanceToStepEnd);
+        announceTurn(currentStep.maneuver, distanceToStepEnd, roadName);
       } else if (distanceToStepEnd < 50 && distanceToStepEnd > 40) {
-        announceTurn(currentStep.maneuver, distanceToStepEnd);
+        announceTurn(currentStep.maneuver, distanceToStepEnd, roadName);
       } else if (distanceToStepEnd < 100 && distanceToStepEnd > 90) {
-        announceTurn(currentStep.maneuver, distanceToStepEnd);
+        announceTurn(currentStep.maneuver, distanceToStepEnd, roadName);
       } else if (distanceToStepEnd < 200 && distanceToStepEnd > 190) {
-        announceTurn(currentStep.maneuver, distanceToStepEnd);
+        announceTurn(currentStep.maneuver, distanceToStepEnd, roadName);
       } else if (distanceToStepEnd < 500 && distanceToStepEnd > 490) {
-        announceTurn(currentStep.maneuver, distanceToStepEnd);
+        announceTurn(currentStep.maneuver, distanceToStepEnd, roadName);
       } else if (distanceToStepEnd < 1000 && distanceToStepEnd > 990) {
-        announceTurn(currentStep.maneuver, distanceToStepEnd);
+        announceTurn(currentStep.maneuver, distanceToStepEnd, roadName);
       }
     }
     
@@ -2559,19 +2949,32 @@ class HomeMapController extends ChangeNotifier {
       _updateBannerWithStep(nextStep);
       
       if (isNavigating && _navigationInitialized) {
-        speak(nextStep.instruction);
+        // CLIENT-FOCUSED: Announce the next instruction for the client
+        final roadName = nextStep.roadName.isNotEmpty ? nextStep.roadName : 'the road';
+        final maneuverText = _getManeuverText(nextStep.maneuver);
+        speak('Your driver will $maneuverText onto $roadName');
       }
     }
   }
 
+  // ============================================================
+  // HANDLE ARRIVAL - CLIENT-FOCUSED
+  // ============================================================
   void _handleArrival() {
     if (!hasArrived) {
       hasArrived = true;
-      driverStatusText = '✅ You have arrived!';
+      _orderStatus = 'arrived';
+      driverStatusText = '✅ Your driver has arrived!';
       showNavigationBanner = false;
-      notifyListeners();
       
-      speak('You have arrived at your destination!');
+      // CLIENT-FOCUSED: "Your driver has arrived" not "You have arrived"
+      if (_navigationInitialized && !_arrivalAnnounced) {
+        _arrivalAnnounced = true;
+        final driverName = activeDriverLocation?['name'] ?? 'Your driver';
+        speak('$driverName has arrived at your location!');
+      }
+      
+      notifyListeners();
       
       stopBackgroundLocationUpdates();
       resetNavigationState();
@@ -2579,7 +2982,7 @@ class HomeMapController extends ChangeNotifier {
       if (_context != null) {
         ScaffoldMessenger.of(_context!).showSnackBar(
           const SnackBar(
-            content: Text('✅ You have arrived at your destination!'),
+            content: Text('✅ Your driver has arrived!'),
             backgroundColor: Colors.green,
             duration: Duration(seconds: 3),
           ),
@@ -2632,7 +3035,7 @@ class HomeMapController extends ChangeNotifier {
   // OFF-ROUTE DETECTION & RECALCULATION
   // ============================================================
   bool _isDriverOffRoute(LatLng driverPosition, List<LatLng> routePoints) {
-    // ✅ If arrived, don't check off-route
+    // If arrived, don't check off-route
     if (hasArrived) return false;
     
     if (routePoints.isEmpty) return false;
@@ -2668,7 +3071,7 @@ class HomeMapController extends ChangeNotifier {
   }
 
   void _recalculateRouteIfNeeded(LatLng driverPosition) {
-    // ✅ If arrived, skip recalculation
+    // If arrived, skip recalculation
     if (hasArrived) {
       print('✅ Already arrived - skipping route recalculation');
       return;
@@ -2683,7 +3086,7 @@ class HomeMapController extends ChangeNotifier {
       isRecalculatingRoute = true;
       
       routeRecalculationTimer = Timer(const Duration(seconds: 3), () async {
-        // ✅ Double-check arrival before recalculation
+        // Double-check arrival before recalculation
         if (hasArrived) {
           isRecalculatingRoute = false;
           print('⏹️ Skip recalculation - already arrived');
@@ -2752,7 +3155,7 @@ class HomeMapController extends ChangeNotifier {
   }
 
   Future<void> _checkTrafficAndUpdateETA() async {
-    // ✅ If arrived, skip traffic check
+    // If arrived, skip traffic check
     if (hasArrived) return;
     
     if (isCheckingTraffic || currentRoutePoints.isEmpty || renderedPosition == null) return;
@@ -2809,7 +3212,7 @@ class HomeMapController extends ChangeNotifier {
   }
 
   void _checkSpeedLimit() async {
-    // ✅ If arrived, skip speed limit check
+    // If arrived, skip speed limit check
     if (hasArrived) return;
     
     if (currentSpeed > 0 && interpolatedDriverPosition != null) {
@@ -2819,7 +3222,7 @@ class HomeMapController extends ChangeNotifier {
       notifyListeners();
       
       if (isSpeeding) {
-        speak('⚠️ Speed limit exceeded. Please slow down to $speedLimit km/h.');
+        speak('⚠️ Your driver is exceeding the speed limit. They are traveling at ${currentSpeed.toStringAsFixed(0)} km/h.');
       }
     }
   }
@@ -3010,7 +3413,7 @@ class HomeMapController extends ChangeNotifier {
   }
 
   // ============================================================
-  // ORDER MANAGEMENT
+  // ORDER MANAGEMENT - FIXED FOR REALTIME STATUS UPDATES
   // ============================================================
   Future<void> _checkActiveOrder() async {
     final user = FirebaseAuth.instance.currentUser;
@@ -3020,7 +3423,7 @@ class HomeMapController extends ChangeNotifier {
       final orders = await FirebaseFirestore.instance
           .collection('orders')
           .where('userId', isEqualTo: user.uid)
-          .where('status', whereIn: ['pending', 'accepted'])
+          .where('status', whereIn: ['pending', 'accepted', 'en_route', 'arrived'])
           .get();
 
       if (orders.docs.isNotEmpty) {
@@ -3035,26 +3438,74 @@ class HomeMapController extends ChangeNotifier {
           activeOrderDetails = data;
           showVehicleSelector = false;
           showFuelSelector = false;
-          isOrderAccepted = status == 'accepted';
+          isOrderAccepted = status == 'accepted' || status == 'en_route' || status == 'arrived';
+          _orderStatus = status;
           driverPhoneNumber = data['driverPhone'] ?? 'N/A';
           showConfirmButton = false;
           selectedDriver = null;
           isFuelSelectorExpanded = false;
           
-          if (status == 'accepted') {
+          if (isOrderAccepted) {
             orderAcceptedTime = DateTime.now();
+            _hasOrderBeenAccepted = true;
           }
           
-          if (status == 'pending') isWaitingForDrivers = true;
+          if (status == 'pending') {
+            isWaitingForDrivers = true;
+            _orderStatus = 'finding_driver';
+          } else {
+            isWaitingForDrivers = false;
+          }
+          
           notifyListeners();
-          _listenToOrderStatus();
+          // 🔥 Start listening for order acceptance to trigger navigation
+          _listenForOrderAcceptance();
+          
           if (activeDriverId != null && isOrderAccepted) _listenToDriverLocation();
         } else {
           activeOrderDetails = data;
-          isOrderAccepted = status == 'accepted';
-          driverPhoneNumber = data['driverPhone'] ?? 'N/A';
-          isWaitingForDrivers = status == 'pending';
-          notifyListeners();
+          final newStatus = status;
+          if (newStatus != _orderStatus) {
+            _orderStatus = newStatus;
+            if (newStatus == 'accepted' || newStatus == 'en_route' || newStatus == 'arrived') {
+              isOrderAccepted = true;
+              isWaitingForDrivers = false;
+              _hasOrderBeenAccepted = true;
+              if (newStatus == 'accepted') {
+                speak('✅ Your driver has accepted your order!');
+                if (_context != null) {
+                  ScaffoldMessenger.of(_context!).showSnackBar(
+                    const SnackBar(content: Text('✅ Driver assigned! Tracking started.'), backgroundColor: Colors.green),
+                  );
+                }
+                if (activeDriverId != null) _listenToDriverLocation();
+              }
+              if (newStatus == 'arrived') {
+                // Only mark arrived if order was accepted first
+                if (_hasOrderBeenAccepted) {
+                  // CLIENT-FOCUSED: "Your driver has arrived"
+                  if (_navigationInitialized && !_arrivalAnnounced) {
+                    _arrivalAnnounced = true;
+                    speak('📍 Your driver has arrived!');
+                  }
+                  hasArrived = true;
+                } else {
+                  print('⚠️ Ignoring arrived status - order was never accepted');
+                }
+              }
+            }
+            if (newStatus == 'completed') {
+              _clearOrder(true);
+              return;
+            }
+            if (newStatus == 'cancelled') {
+              _clearOrder(false);
+              return;
+            }
+            driverPhoneNumber = data['driverPhone'] ?? 'N/A';
+            isWaitingForDrivers = status == 'pending';
+            notifyListeners();
+          }
         }
       } else if (hasActiveOrder) {
         _cancelDriverListener();
@@ -3092,6 +3543,7 @@ class HomeMapController extends ChangeNotifier {
         orderAcceptedTime = null;
         hasDriverArrived = false;
         driverArrivalTime = null;
+        _orderStatus = 'idle';
         stopBackgroundLocationUpdates();
         resetNavigationState();
         notifyListeners();
@@ -3102,9 +3554,15 @@ class HomeMapController extends ChangeNotifier {
     }
   }
 
-  void _listenToOrderStatus() {
-    orderStatusSubscription?.cancel();
+  // ============================================================
+  // 🔥 FIXED: Listen for order acceptance ONLY - Navigation ONLY after driver accepts
+  // ============================================================
+  void _listenForOrderAcceptance() {
     if (activeOrderId == null) return;
+
+    // Cancel any existing subscription to avoid duplicates
+    orderStatusSubscription?.cancel();
+    orderStatusSubscription = null;
 
     orderStatusSubscription = FirebaseFirestore.instance
         .collection('orders')
@@ -3112,34 +3570,86 @@ class HomeMapController extends ChangeNotifier {
         .snapshots()
         .listen((snapshot) {
           if (!snapshot.exists) return;
-          final data = snapshot.data();
-          final status = data?['status'] ?? 'pending';
-          
-          if (status == 'accepted' && !isOrderAccepted) {
+          final data = snapshot.data()!;
+          final status = data['status'] ?? 'pending';
+
+          print('📡 Firebase triggered navigation listener - status: $status, navigationInitialized: $_navigationInitialized, disposed: $_disposed');
+
+          // Don't proceed if disposed
+          if (_disposed) return;
+
+          // 🔥 CRITICAL FIX: ONLY start navigation when status is 'accepted'
+          // AND navigation is NOT already initialized
+          if (status == 'accepted' && !_navigationInitialized) {
+            // Mark order as accepted
             isOrderAccepted = true;
+            _hasOrderBeenAccepted = true;
             activeOrderDetails = data;
-            isWaitingForDrivers = false;
-            driverPhoneNumber = data?['driverPhone'] ?? 'N/A';
-            showDriverInfo = true;
+            showVehicleSelector = false;
+            showFuelSelector = false;
             showConfirmButton = false;
-            isFuelSelectorExpanded = false;
-            selectedDriver = null;
-            showCallDriverButton = true;
-            orderAcceptedTime = DateTime.now();
-            notifyListeners();
-            
-            speak('Driver has been assigned to your order.');
-            
+            isWaitingForDrivers = false;
+
+            print('✅ Firebase triggered: Order accepted! Starting navigation...');
+
             if (_context != null) {
               ScaffoldMessenger.of(_context!).showSnackBar(
-                const SnackBar(content: Text('✅ Driver assigned! Tracking started.'), backgroundColor: Colors.green),
+                const SnackBar(content: Text('✅ Driver accepted order! Starting navigation...'), backgroundColor: Colors.green),
               );
             }
-            if (activeDriverId != null) _listenToDriverLocation();
-          } else if (status == 'cancelled' || status == 'completed') {
+
+            // Get driver location from activeDriverLocation
+            // The driver's location is already being tracked via _realtimeDriverSubscription
+            if (activeDriverLocation != null && currentPosition != null) {
+              final lat = activeDriverLocation!['lat'] ?? 0;
+              final lng = activeDriverLocation!['lng'] ?? 0;
+              if (lat != 0 && lng != 0) {
+                print('📍 Firebase triggered: Drawing route to customer...');
+                drawDriverRoute(lat, lng);
+              }
+            } else {
+              print('⏳ Waiting for driver location before drawing route...');
+              // The route will be drawn when driver location updates
+            }
+
+            // Start driver location tracking if not already started
+            if (activeDriverId != null) {
+              _listenToDriverLocation();
+            }
+
+            notifyListeners();
+          }
+          
+          // Handle other status changes (but don't trigger navigation)
+          if (status == 'en_route' && _hasOrderBeenAccepted) {
+            driverStatusText = '🚚 Your driver is on the way!';
+            notifyListeners();
+          }
+          
+          if (status == 'arrived' && _hasOrderBeenAccepted) {
+            // CLIENT-FOCUSED: "Your driver has arrived"
+            if (_navigationInitialized && !_arrivalAnnounced) {
+              _arrivalAnnounced = true;
+              speak('📍 Your driver has arrived!');
+            }
+            hasArrived = true;
+            hasDriverArrived = true;
+            driverStatusText = '📍 Your driver has arrived!';
+            notifyListeners();
+          }
+          
+          if (status == 'completed' || status == 'cancelled') {
             _clearOrder(status == 'completed');
           }
-        }, onError: (error) => print('Order status listener error: $error'));
+        }, onError: (error) {
+          print('Order acceptance listener error: $error');
+        });
+  }
+
+  void _listenToOrderStatus() {
+    // This method is now replaced by _listenForOrderAcceptance
+    // Keep it for backward compatibility but redirect
+    _listenForOrderAcceptance();
   }
 
   void _clearOrder(bool isCompleted) {
@@ -3181,21 +3691,15 @@ class HomeMapController extends ChangeNotifier {
     orderAcceptedTime = null;
     hasDriverArrived = false;
     driverArrivalTime = null;
+    _orderStatus = isCompleted ? 'completed' : 'cancelled';
     stopBackgroundLocationUpdates();
     resetNavigationState();
     notifyListeners();
     
     if (isCompleted) {
       speak('Your fuel has been delivered. Thank you for using our service!');
-    }
-    
-    if (_context != null) {
-      ScaffoldMessenger.of(_context!).showSnackBar(
-        SnackBar(
-          content: Text(isCompleted ? '✅ Fuel delivered successfully!' : 'Order was cancelled'),
-          backgroundColor: isCompleted ? Colors.green : Colors.orange,
-        ),
-      );
+    } else {
+      speak('Your order has been cancelled.');
     }
   }
 
@@ -3209,6 +3713,10 @@ class HomeMapController extends ChangeNotifier {
     trafficRerouteTimer?.cancel();
     speedCheckTimer?.cancel();
     stopBackgroundLocationUpdates();
+    // 🔥 Cancel realtime subscriptions
+    _realtimeDriverSubscription?.cancel();
+    _realtimePingTimer?.cancel();
+    _priorityUpdateTimer?.cancel();
   }
 
   // ============================================================
@@ -3265,7 +3773,7 @@ class HomeMapController extends ChangeNotifier {
   }
 
   // ============================================================
-  // FUEL SELECTION - FIXED: Added _validateLitres
+  // FUEL SELECTION
   // ============================================================
   void selectFuel(String fuelType) {
     selectedFuelType = fuelType;
@@ -3282,7 +3790,7 @@ class HomeMapController extends ChangeNotifier {
     hasUserSelectedFuel = true;
     hasUserAdjustedLitres = false;
     hasUserSelectedDriver = false;
-    _validateLitres(); // ✅ FIXED: Added validation
+    _validateLitres();
     notifyListeners();
     _loadNearbyDrivers();
   }
@@ -3540,9 +4048,10 @@ class HomeMapController extends ChangeNotifier {
       hasUserSelectedDriver = false;
       activeOrderId = orderId;
       activeDriverId = driverId;
+      _orderStatus = 'pending';
       notifyListeners();
       
-      _listenToOrderStatus();
+      _listenForOrderAcceptance();
       
       startBackgroundLocationUpdates();
       
@@ -3728,6 +4237,7 @@ class HomeMapController extends ChangeNotifier {
       orderAcceptedTime = null;
       hasDriverArrived = false;
       driverArrivalTime = null;
+      _orderStatus = 'cancelled';
       stopBackgroundLocationUpdates();
       resetNavigationState();
       notifyListeners();

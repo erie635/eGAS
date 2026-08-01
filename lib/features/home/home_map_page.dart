@@ -1,5 +1,7 @@
 // ============================================================
 // FILE: home_map_page.dart - WITH LARGER FONTS - CLEAN VERSION
+// INCLUDES V-POWER + 3 FUEL OPTIONS IN BOTTOM SHEET
+// CALL DRIVER BUTTON - CENTERED BOTTOM (ADJUSTED UP)
 // ============================================================
 
 import 'package:flutter/material.dart';
@@ -53,16 +55,23 @@ class _HomeMapPageState extends State<HomeMapPage> with WidgetsBindingObserver {
     _swipeThrottleTimer = null;
     WidgetsBinding.instance.removeObserver(this);
     _controller.removeListener(_onControllerUpdate);
-    _controller.dispose();
+    
+    try {
+      _controller.dispose();
+    } catch (e) {
+      print('⚠️ Error disposing HomeMapController: $e');
+    }
+    
     super.dispose();
   }
 
   void _safeSetState(VoidCallback fn) {
-    if (!mounted) return;
+    if (!mounted || _isDisposed) return;
     setState(fn);
   }
 
   void _onControllerUpdate() {
+    if (_isDisposed) return;
     _debounceTimer?.cancel();
     _debounceTimer = Timer(const Duration(milliseconds: 50), () {
       _safeSetState(() {});
@@ -206,14 +215,77 @@ class _HomeMapPageState extends State<HomeMapPage> with WidgetsBindingObserver {
               if (_controller.isOrderAccepted && _controller.isNavigating && _controller.driverActionText.isNotEmpty && !_controller.showNavigationBanner && !_controller.hasArrived)
                 _buildDriverActionInfo(),
 
-              if (_controller.showCallDriverButton && _controller.activeDriverLocation != null && _controller.driverPhoneNumber != null)
-                _buildCallDriverButton(),
-
               if (_controller.showConfirmButton && _controller.selectedDriver != null && !_controller.hasActiveOrder && !_controller.isAutoSelecting && _controller.hasUserSelectedDriver)
                 _buildConfirmOrderButton(),
 
               if (_controller.showUseAvailableButton && _controller.maxAvailableLitres > 0 && !_controller.hasActiveOrder && !_controller.showConfirmButton)
                 _buildUseAvailableFuelButton(),
+
+              // ============================================================
+              // CALL DRIVER BUTTON - CENTERED BOTTOM (ADJUSTED UP)
+              // ============================================================
+              if ((_controller.isOrderAccepted || _controller.hasActiveOrder) && 
+                  _controller.driverPhoneNumber != null && 
+                  _controller.driverPhoneNumber != 'N/A' &&
+                  _controller.driverPhoneNumber!.isNotEmpty)
+                Positioned(
+                  bottom: _controller.hasArrived ? 140 : 100,
+                  left: 0,
+                  right: 0,
+                  child: Center(
+                    child: GestureDetector(
+                      key: const ValueKey('callDriverButton'),
+                      onTap: () {
+                        if (!_isDisposed && mounted) {
+                          final name = _controller.activeDriverLocation?['name'] ?? 
+                                      _controller.activeOrderDetails?['driverName'] ?? 
+                                      'Driver';
+                          final phone = _controller.driverPhoneNumber ?? 'N/A';
+                          _controller.callDriver(name, phone);
+                        }
+                      },
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
+                        decoration: BoxDecoration(
+                          color: Colors.green.shade700,
+                          borderRadius: BorderRadius.circular(30),
+                          boxShadow: [
+                            BoxShadow(
+                              color: Colors.green.withOpacity(0.6),
+                              blurRadius: 15,
+                              spreadRadius: 3,
+                            ),
+                            BoxShadow(
+                              color: Colors.green.withOpacity(0.3),
+                              blurRadius: 30,
+                              spreadRadius: 5,
+                            ),
+                          ],
+                          border: Border.all(color: Colors.white, width: 2),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: const [
+                            Icon(
+                              Icons.phone,
+                              color: Colors.white,
+                              size: 22,
+                            ),
+                            SizedBox(width: 10),
+                            Text(
+                              'Call Driver',
+                              style: TextStyle(
+                                color: Colors.white,
+                                fontWeight: FontWeight.bold,
+                                fontSize: 16,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
 
               _buildBottomSheet(),
             ],
@@ -304,7 +376,7 @@ class _HomeMapPageState extends State<HomeMapPage> with WidgetsBindingObserver {
                             final fuelType = fuel['fuelType'] as String;
                             
                             return GestureDetector(
-                              key: ValueKey('fuel_${fuelType}_${index}'),
+                              key: ValueKey('fuel_${fuelType}_$index'),
                               onTap: () {
                                 if (!_isDisposed && mounted) {
                                   _controller.selectFuel(fuelType);
@@ -1014,65 +1086,6 @@ class _HomeMapPageState extends State<HomeMapPage> with WidgetsBindingObserver {
   }
 
   // ============================================================
-  // CALL DRIVER BUTTON - LARGER FONTS
-  // ============================================================
-  Widget _buildCallDriverButton() {
-    return Positioned(
-      top: 100,
-      right: 16,
-      child: GestureDetector(
-        key: const ValueKey('callDriverButton'),
-        onTap: () {
-          if (!_isDisposed && mounted) {
-            final name = _controller.activeDriverLocation?['name'] ?? 'Driver';
-            final phone = _controller.driverPhoneNumber ?? 'N/A';
-            _controller.callDriver(name, phone);
-          }
-        },
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-          decoration: BoxDecoration(
-            color: Colors.blue.shade700,
-            borderRadius: BorderRadius.circular(25),
-            boxShadow: [
-              BoxShadow(
-                color: Colors.blue.withOpacity(0.6),
-                blurRadius: 15,
-                spreadRadius: 3,
-              ),
-              BoxShadow(
-                color: Colors.blue.withOpacity(0.3),
-                blurRadius: 30,
-                spreadRadius: 5,
-              ),
-            ],
-            border: Border.all(color: Colors.white, width: 2),
-          ),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Icon(
-                Icons.phone,
-                color: Colors.white,
-                size: 22,
-              ),
-              const SizedBox(width: 8),
-              Text(
-                'Call Driver',
-                style: TextStyle(
-                  color: Colors.white,
-                  fontWeight: FontWeight.bold,
-                  fontSize: 15,
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  // ============================================================
   // CONFIRM ORDER BUTTON - LARGER FONTS
   // ============================================================
   Widget _buildConfirmOrderButton() {
@@ -1244,7 +1257,7 @@ class _HomeMapPageState extends State<HomeMapPage> with WidgetsBindingObserver {
   }
 
   // ============================================================
-  // SMOOTH DRAGGABLE BOTTOM SHEET - LARGER FONTS
+  // SMOOTH DRAGGABLE BOTTOM SHEET - WITH V-POWER + 3 FUEL OPTIONS
   // ============================================================
   Widget _buildBottomSheet() {
     final bool showBottomSheet = !_controller.hasActiveOrder && 
@@ -1401,7 +1414,7 @@ class _HomeMapPageState extends State<HomeMapPage> with WidgetsBindingObserver {
                               ListView.builder(
                                 shrinkWrap: true,
                                 physics: const NeverScrollableScrollPhysics(),
-                                itemCount: _controller.fuelTypes.keys.length > 3 ? 3 : _controller.fuelTypes.keys.length,
+                                itemCount: _controller.fuelTypes.keys.length,
                                 itemBuilder: (context, index) {
                                   final fuel = _controller.fuelTypes.keys.elementAt(index);
                                   final fuelData = _controller.fuelTypes[fuel]!;
@@ -1671,7 +1684,7 @@ class _HomeMapPageState extends State<HomeMapPage> with WidgetsBindingObserver {
                                     Icon(
                                       Icons.swipe_up,
                                       size: 20,
-                                      color: Colors.grey.shade500,
+                                      color: Colors.red.shade500,
                                     ),
                                     const SizedBox(width: 6),
                                     Text(
