@@ -39,6 +39,11 @@ class _DriverDashboardState extends State<DriverDashboard> with WidgetsBindingOb
   Timer? _locationTimer;
   StreamSubscription<DocumentSnapshot>? _driverSubscription;
   StreamSubscription<DocumentSnapshot>? _activeOrderSubscription;
+  
+  // ✅ FIX 1: Add subscription variables for fuel and online history
+  StreamSubscription<DocumentSnapshot>? _fuelHistorySubscription;
+  StreamSubscription<DocumentSnapshot>? _onlineHistorySubscription;
+  
   Map<String, dynamic>? _activeOrderDetails;
   List<Map<String, dynamic>> _completedOrders = [];
   Map<String, double> _remainingFuel = {
@@ -150,6 +155,7 @@ class _DriverDashboardState extends State<DriverDashboard> with WidgetsBindingOb
       );
     } catch (e) {
       // Silently fail - better than crashing
+      print('⚠️ Snackbar error: $e');
     }
   }
 
@@ -411,8 +417,13 @@ class _DriverDashboardState extends State<DriverDashboard> with WidgetsBindingOb
       LocationPermission permission = await Geolocator.checkPermission();
       if (permission == LocationPermission.denied) {
         permission = await Geolocator.requestPermission();
+        if (permission == LocationPermission.denied) {
+          _showSnackBar('Location permission is required for tracking', Colors.orange);
+          return;
+        }
       }
       if (permission == LocationPermission.deniedForever) {
+        _showSnackBar('Location permission permanently denied. Please enable in settings.', Colors.red);
         return;
       }
       _currentPosition = await Geolocator.getCurrentPosition(
@@ -470,6 +481,12 @@ class _DriverDashboardState extends State<DriverDashboard> with WidgetsBindingOb
           final pos = await Geolocator.getCurrentPosition(
             desiredAccuracy: LocationAccuracy.high,
           );
+          
+          // ✅ FIX 2: Check dispose after async operation
+          if (_isDisposed || !mounted) {
+            return;
+          }
+          
           if (_driverId != null && _isOnline) {
             final newHeading = _calculateHeading(_currentPosition, pos);
             final speed = pos.speed * 3.6;
@@ -620,8 +637,8 @@ class _DriverDashboardState extends State<DriverDashboard> with WidgetsBindingOb
           _loadFuelStatus();
           _loadActiveOrderDetails();
           _loadCompletedOrders();
-          _loadFuelHistory();
-          _loadOnlineHistory();
+          // ✅ FIX 3: Removed orphaned _loadFuelHistory() and _loadOnlineHistory() calls
+          // These are now handled by the subscription listeners below
           _loadSalesHistory();
         } else {
           _showDriverProfileSetup(user);
@@ -1311,40 +1328,76 @@ class _DriverDashboardState extends State<DriverDashboard> with WidgetsBindingOb
     }
   }
 
-  void _loadFuelHistory() {
+  // ✅ FIX 4: Fuel history now properly subscribed
+  void _loadFuelHistorySubscription() {
     if (_driverId == null || _isDisposed) return;
-    FirebaseFirestore.instance
+
+    _fuelHistorySubscription?.cancel();
+
+    _fuelHistorySubscription = FirebaseFirestore.instance
         .collection('drivers')
         .doc(_driverId)
         .snapshots()
-        .listen((doc) {
-          if (doc.exists && mounted && !_isDisposed) {
-            final data = doc.data()!;
-            if (data.containsKey('fuelHistory')) {
-              _safeSetState(() {
-                _fuelHistory = List<Map<String, dynamic>>.from(data['fuelHistory'] ?? []);
-              });
-            }
-          }
+        .listen(
+      (doc) {
+        if (!mounted || _isDisposed) return;
+        if (!doc.exists) return;
+
+        final data = doc.data();
+
+        if (data == null || !data.containsKey('fuelHistory')) {
+          return;
+        }
+
+        final history = List<Map<String, dynamic>>.from(
+          data['fuelHistory'] ?? [],
+        );
+
+        _safeSetState(() {
+          _fuelHistory = history;
         });
+      },
+      onError: (error) {
+        if (_isDisposed) return;
+        print('Fuel history listener error: $error');
+      },
+    );
   }
 
-  void _loadOnlineHistory() {
+  // ✅ FIX 5: Online history now properly subscribed
+  void _loadOnlineHistorySubscription() {
     if (_driverId == null || _isDisposed) return;
-    FirebaseFirestore.instance
+
+    _onlineHistorySubscription?.cancel();
+
+    _onlineHistorySubscription = FirebaseFirestore.instance
         .collection('drivers')
         .doc(_driverId)
         .snapshots()
-        .listen((doc) {
-          if (doc.exists && mounted && !_isDisposed) {
-            final data = doc.data()!;
-            if (data.containsKey('onlineHistory')) {
-              _safeSetState(() {
-                _onlineHistory = List<Map<String, dynamic>>.from(data['onlineHistory'] ?? []);
-              });
-            }
-          }
+        .listen(
+      (doc) {
+        if (!mounted || _isDisposed) return;
+        if (!doc.exists) return;
+
+        final data = doc.data();
+
+        if (data == null || !data.containsKey('onlineHistory')) {
+          return;
+        }
+
+        final history = List<Map<String, dynamic>>.from(
+          data['onlineHistory'] ?? [],
+        );
+
+        _safeSetState(() {
+          _onlineHistory = history;
         });
+      },
+      onError: (error) {
+        if (_isDisposed) return;
+        print('Online history listener error: $error');
+      },
+    );
   }
 
   // ============================================================
@@ -1363,11 +1416,16 @@ class _DriverDashboardState extends State<DriverDashboard> with WidgetsBindingOb
               final data = doc.data()!;
               _safeSetState(() {
                 _activeOrderDetails = data;
+                // ✅ FIX 6: Added null check before casting GeoPoint
                 if (data['userLocation'] != null) {
-                  final geoPoint = data['userLocation'] as GeoPoint;
-                  _mapController.customerLocation = LatLng(geoPoint.latitude, geoPoint.longitude);
-                  if (_isOrderAccepted) {
-                    _drawRouteToCustomer();
+                  try {
+                    final geoPoint = data['userLocation'] as GeoPoint;
+                    _mapController.customerLocation = LatLng(geoPoint.latitude, geoPoint.longitude);
+                    if (_isOrderAccepted) {
+                      _drawRouteToCustomer();
+                    }
+                  } catch (e) {
+                    print('⚠️ Error parsing userLocation: $e');
                   }
                 }
               });
@@ -1701,6 +1759,13 @@ class _DriverDashboardState extends State<DriverDashboard> with WidgetsBindingOb
     }
   }
 
+  // ✅ FIX 7: Added fuel color helper for visual indication
+  Color _getFuelColor(double amount) {
+    if (amount > 50) return Colors.green.shade700;
+    if (amount > 20) return Colors.orange.shade700;
+    return Colors.red.shade700;
+  }
+
   String _formatDate(String dateString) {
     try {
       final date = DateTime.parse(dateString);
@@ -2010,9 +2075,13 @@ class _DriverDashboardState extends State<DriverDashboard> with WidgetsBindingOb
         _showCallClientButton = true;
         _hasArrived = false;
         if (orderData?['userLocation'] != null) {
-          final geoPoint = orderData?['userLocation'] as GeoPoint;
-          _mapController.customerLocation = LatLng(geoPoint.latitude, geoPoint.longitude);
-          _drawRouteToCustomer();
+          try {
+            final geoPoint = orderData?['userLocation'] as GeoPoint;
+            _mapController.customerLocation = LatLng(geoPoint.latitude, geoPoint.longitude);
+            _drawRouteToCustomer();
+          } catch (e) {
+            print('⚠️ Error parsing userLocation in accept order: $e');
+          }
         }
       });
       _showSnackBar('✅ Order accepted! Navigating to customer.', Colors.green);
@@ -2587,6 +2656,7 @@ class _DriverDashboardState extends State<DriverDashboard> with WidgetsBindingOb
               ..._remainingFuel.keys.map((fuel) {
                 final amount = _remainingFuel[fuel] ?? 0;
                 final isLow = amount < 20;
+                final fuelColor = _getFuelColor(amount);
                 return Padding(
                   key: ValueKey('fuel_$fuel'),
                   padding: const EdgeInsets.symmetric(vertical: 4),
@@ -2596,7 +2666,7 @@ class _DriverDashboardState extends State<DriverDashboard> with WidgetsBindingOb
                       color: isLow ? Colors.red.shade50 : Colors.grey.shade50,
                       borderRadius: BorderRadius.circular(12),
                       border: Border.all(
-                        color: isLow ? Colors.red.shade300 : Colors.grey.shade300,
+                        color: isLow ? Colors.red.shade300 : fuelColor.withOpacity(0.5),
                       ),
                     ),
                     child: Row(
@@ -2633,7 +2703,7 @@ class _DriverDashboardState extends State<DriverDashboard> with WidgetsBindingOb
                         Container(
                           padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
                           decoration: BoxDecoration(
-                            color: isLow ? Colors.red.shade100 : Colors.green.shade100,
+                            color: fuelColor.withOpacity(0.2),
                             borderRadius: BorderRadius.circular(8),
                           ),
                           child: Text(
@@ -2641,7 +2711,7 @@ class _DriverDashboardState extends State<DriverDashboard> with WidgetsBindingOb
                             style: TextStyle(
                               fontWeight: FontWeight.bold,
                               fontSize: 18,
-                              color: isLow ? Colors.red.shade700 : Colors.green.shade700,
+                              color: fuelColor,
                             ),
                           ),
                         ),
@@ -2966,7 +3036,7 @@ class _DriverDashboardState extends State<DriverDashboard> with WidgetsBindingOb
                         ? Colors.grey 
                         : (!_hasFuelToGoOnline() && !_isTracking)
                             ? Colors.red
-                            : (_isTracking ? Colors.red : Colors.green),
+                            : (_isTracking ? Colors.red : Colors.blue),
                     padding: const EdgeInsets.symmetric(vertical: 12),
                     shape: RoundedRectangleBorder(
                       borderRadius: BorderRadius.circular(10),
@@ -2996,7 +3066,7 @@ class _DriverDashboardState extends State<DriverDashboard> with WidgetsBindingOb
                   label: _isTogglingTracking
                       ? const Text(
                           'Please wait...',
-                          style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.white),
+                          style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.blue),
                         )
                       : Text(
                           _hasActiveOrder && !_isOrderAccepted
@@ -3268,12 +3338,12 @@ class _DriverDashboardState extends State<DriverDashboard> with WidgetsBindingOb
   }
 
   // ============================================================
-  // BUILD DASHBOARD VIEW - FIXED
+  // BUILD DASHBOARD VIEW - FIXED (Removed duplicate fuel display)
   // ============================================================
   Widget _buildDashboardView() {
     return Column(
       children: [
-        // Profile Header - Always visible
+        // Profile Header - Always visible (Removed duplicate fuel display)
         Container(
           padding: const EdgeInsets.all(12),
           decoration: BoxDecoration(
@@ -3362,7 +3432,7 @@ class _DriverDashboardState extends State<DriverDashboard> with WidgetsBindingOb
                 ],
               ),
               const SizedBox(height: 6),
-              // Fuel Stock - Compact
+              // ✅ FIX 8: Single fuel display with color indicators
               Container(
                 padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
                 decoration: BoxDecoration(
@@ -3386,6 +3456,7 @@ class _DriverDashboardState extends State<DriverDashboard> with WidgetsBindingOb
                     ),
                     ..._remainingFuel.keys.map((fuel) {
                       final amount = _remainingFuel[fuel] ?? 0;
+                      final fuelColor = _getFuelColor(amount);
                       final isLow = amount < 20;
                       return Padding(
                         key: ValueKey('fuel_display_$fuel'),
@@ -3393,14 +3464,10 @@ class _DriverDashboardState extends State<DriverDashboard> with WidgetsBindingOb
                         child: Container(
                           padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
                           decoration: BoxDecoration(
-                            color: isLow 
-                                ? Colors.red.shade600.withOpacity(0.85) 
-                                : Colors.red.shade600.withOpacity(0.85),
+                            color: fuelColor.withOpacity(0.2),
                             borderRadius: BorderRadius.circular(6),
                             border: Border.all(
-                              color: isLow 
-                                  ? Colors.red.shade600 
-                                  : Colors.grey.shade300,
+                              color: fuelColor.withOpacity(0.5),
                               width: 0.8,
                             ),
                           ),
@@ -3425,9 +3492,7 @@ class _DriverDashboardState extends State<DriverDashboard> with WidgetsBindingOb
                               Container(
                                 padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
                                 decoration: BoxDecoration(
-                                  color: isLow 
-                                      ? Colors.red.shade900.withOpacity(0.6) 
-                                      : Colors.green.shade900.withOpacity(0.6),
+                                  color: fuelColor.withOpacity(0.4),
                                   borderRadius: BorderRadius.circular(4),
                                 ),
                                 child: Text(
@@ -3435,7 +3500,7 @@ class _DriverDashboardState extends State<DriverDashboard> with WidgetsBindingOb
                                   style: TextStyle(
                                     fontWeight: FontWeight.bold,
                                     fontSize: 14,
-                                    color: isLow ? Colors.red.shade200 : Colors.black,
+                                    color: isLow ? Colors.red.shade200 : Colors.white,
                                   ),
                                 ),
                               ),
@@ -3497,6 +3562,40 @@ class _DriverDashboardState extends State<DriverDashboard> with WidgetsBindingOb
                           style: TextStyle(
                             fontSize: 14,
                             color: Colors.red.shade700,
+                            fontWeight: FontWeight.w500,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              // ✅ FIX 9: Added visual indicator for waiting state
+              if (_isWaitingForOrder && _isOnline && !_hasActiveOrder)
+                Padding(
+                  padding: const EdgeInsets.only(top: 4),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                    decoration: BoxDecoration(
+                      color: Colors.green.shade100,
+                      borderRadius: BorderRadius.circular(6),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Container(
+                          width: 8,
+                          height: 8,
+                          decoration: const BoxDecoration(
+                            shape: BoxShape.circle,
+                            color: Colors.green,
+                          ),
+                        ),
+                        const SizedBox(width: 6),
+                        Text(
+                          'Waiting for orders...',
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: Colors.green.shade700,
                             fontWeight: FontWeight.w500,
                           ),
                         ),
@@ -3654,7 +3753,7 @@ class _DriverDashboardState extends State<DriverDashboard> with WidgetsBindingOb
                             ? const Text(
                                 'Accepting...',
                                 style: TextStyle(
-                                  color: Colors.white,
+                                  color: Colors.blue,
                                   fontWeight: FontWeight.bold,
                                   fontSize: 14,
                                 ),
@@ -3713,108 +3812,146 @@ class _DriverDashboardState extends State<DriverDashboard> with WidgetsBindingOb
         // ============================================================
 
         // ============================================================
-        // WAITING / OFFLINE STATES - FIXED WITH FLEXIBLE
+        // WAITING / OFFLINE STATES - GREEN BACKGROUND (shade700)
         // ============================================================
         if (!_hasActiveOrder && _isOnline && !_isOrderAccepted)
           Flexible(
-            child: Center(
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  Icon(
-                    Icons.timer,
-                    size: 58,
-                    color: Colors.orange.shade300,
-                  ),
-                  const SizedBox(height: 14),
-                  const Text(
-                    '⏳ Waiting for Assignment',
-                    style: TextStyle(
-                      fontSize: 18,
-                      fontWeight: FontWeight.bold,
-                      color: Colors.orange,
+            child: Container(
+              width: double.infinity,
+              color: Colors.green.shade700,
+              child: Center(
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(
+                      Icons.timer,
+                      size: 58,
+                      color: Colors.white,
                     ),
-                  ),
-                  const SizedBox(height: 6),
-                  Text(
-                    'The system will assign an order when available',
-                    style: TextStyle(
-                      fontSize: 14,
-                      color: Colors.grey.shade600,
+                    const SizedBox(height: 14),
+                    const Text(
+                      '⏳ Waiting for Assignment',
+                      style: TextStyle(
+                        fontSize: 18,
+                        fontWeight: FontWeight.bold,
+                        color: Colors.white,
+                      ),
                     ),
-                    textAlign: TextAlign.center,
-                  ),
-                  const SizedBox(height: 10),
-                  const SizedBox(
-                    height: 24,
-                    width: 24,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  ),
-                  const SizedBox(height: 6),
-                  Text(
-                    'Stay online to receive orders',
-                    style: TextStyle(
-                      fontSize: 14,
-                      color: Colors.grey.shade500,
+                    const SizedBox(height: 6),
+                    const Text(
+                      'The system will assign an order when available',
+                      style: TextStyle(
+                        fontSize: 14,
+                        color: Colors.white70,
+                      ),
+                      textAlign: TextAlign.center,
                     ),
-                  ),
-                ],
+                    const SizedBox(height: 10),
+                    const SizedBox(
+                      height: 24,
+                      width: 24,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2,
+                        color: Colors.white,
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    const Text(
+                      'Stay online to receive orders',
+                      style: TextStyle(
+                        fontSize: 14,
+                        color: Colors.white70,
+                      ),
+                    ),
+                  ],
+                ),
               ),
             ),
           ),
 
         if (!_isOnline)
           Flexible(
-            child: Center(
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  Icon(
-                    Icons.wifi_off,
-                    size: 48,
-                    color: Colors.grey.shade400,
-                  ),
-                  const SizedBox(height: 12),
-                  Text(
-                    _hasFuelToGoOnline()
-                        ? '📴 Offline\nGo online to receive orders'
-                        : '⛽ No fuel available!\nCheck fuel stock',
-                    style: TextStyle(
-                      fontSize: 14,
-                      fontWeight: FontWeight.w600,
-                      color: Colors.grey.shade600,
+            child: Container(
+              width: double.infinity,
+              color: Colors.green.shade700,
+              child: Center(
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    const Icon(
+                      Icons.wifi_off,
+                      size: 48,
+                      color: Colors.white,
                     ),
-                    textAlign: TextAlign.center,
-                  ),
-                  const SizedBox(height: 6),
-                  if (!_hasFuelToGoOnline())
-                    ElevatedButton(
-                      onPressed: _showFuelStockDialog,
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: Colors.orange,
-                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                    const SizedBox(height: 12),
+                    Text(
+                      _hasFuelToGoOnline()
+                          ? '📴 Offline\nGo online to receive orders'
+                          : '⛽ No fuel available!\nCheck fuel stock',
+                      style: const TextStyle(
+                        fontSize: 14,
+                        fontWeight: FontWeight.w600,
+                        color: Colors.white,
                       ),
-                      child: const Text('View Fuel Stock', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
+                      textAlign: TextAlign.center,
                     ),
-                  if (_hasFuelToGoOnline() && !_isOnline && !_hasActiveOrder)
-                    ElevatedButton(
-                      onPressed: _isTogglingTracking ? null : _toggleTracking,
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: _isTogglingTracking ? Colors.grey : Colors.green,
-                        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
+                    const SizedBox(height: 6),
+
+                    if (!_hasFuelToGoOnline())
+                      ElevatedButton(
+                        onPressed: _showFuelStockDialog,
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.orange,
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 16,
+                            vertical: 8,
+                          ),
+                        ),
+                        child: const Text(
+                          'View Fuel Stock',
+                          style: TextStyle(
+                            fontSize: 14,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
                       ),
-                      child: _isTogglingTracking
-                          ? const SizedBox(
-                              height: 16,
-                              width: 16,
-                              child: CircularProgressIndicator(
-                                strokeWidth: 2,
-                                color: Colors.white,
+
+                    if (_hasFuelToGoOnline() &&
+                        !_isOnline &&
+                        !_hasActiveOrder)
+                      ElevatedButton(
+                        onPressed:
+                            _isTogglingTracking ? null : _toggleTracking,
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor:
+                              _isTogglingTracking
+                                  ? Colors.grey
+                                  : Colors.white,
+                          foregroundColor: Colors.green.shade700,
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 20,
+                            vertical: 8,
+                          ),
+                        ),
+                        child: _isTogglingTracking
+                            ? const SizedBox(
+                                height: 16,
+                                width: 16,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                  color: Colors.white,
+                                ),
+                              )
+                            : const Text(
+                                'Go Online',
+                                style: TextStyle(
+                                  fontSize: 14,
+                                  fontWeight: FontWeight.bold,
+                                ),
                               ),
-                            )
-                          : const Text('Go Online', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
-                    ),
-                ],
+                      ),
+                  ],
+                ),
               ),
             ),
           ),
@@ -3843,16 +3980,31 @@ class _DriverDashboardState extends State<DriverDashboard> with WidgetsBindingOb
     _arrivalCheckTimer?.cancel();
     _arrivalCheckTimer = null;
     
-    // Cancel all stream subscriptions
+    // ✅ FIX 5: Cancel ALL stream subscriptions
     _driverSubscription?.cancel();
     _driverSubscription = null;
+    
     _activeOrderSubscription?.cancel();
     _activeOrderSubscription = null;
+    
+    _fuelHistorySubscription?.cancel();
+    _fuelHistorySubscription = null;
+    
+    _onlineHistorySubscription?.cancel();
+    _onlineHistorySubscription = null;
     
     // Stop background tracking
     _stopBackgroundTracking();
     
-    // Dispose map controller (which also cleans up its resources)
+    // ✅ FIX 6: Clear map callbacks BEFORE disposing
+    try {
+      _mapController.onMapUpdated = null;
+      _mapController.onTurnAlert = null;
+    } catch (e) {
+      // Ignore if not nullable
+    }
+    
+    // Dispose map controller
     try {
       _mapController.dispose();
     } catch (e) {

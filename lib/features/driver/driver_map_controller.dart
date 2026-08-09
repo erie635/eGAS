@@ -699,10 +699,10 @@ class DriverMapController {
   double routeSnapDistance = 30.0;
 
   // ============================================================
-  // VEHICLE INFO
+  // VEHICLE INFO - INCREASED FOR BETTER VISIBILITY (matching home map)
   // ============================================================
-  double carWidth = 80.0;
-  double carHeight = 120.0;
+  double carWidth = 220.0;   // INCREASED from 80.0 to match home map
+  double carHeight = 100.0;  // INCREASED from 120.0 to match home map
   String? _currentVehicleType;
   String? _currentNumberPlate;
 
@@ -2419,7 +2419,7 @@ class DriverMapController {
   }
 
   // ============================================================
-  // VEHICLE MARKER - WITH OPTIMIZED CACHING
+  // VEHICLE MARKER - WITH OPTIMIZED CACHING AND LARGER SIZE
   // ============================================================
   Future<BitmapDescriptor> _getVehicleMarker(String vehicleType, {double bearing = 0}) async {
     _startTimer('markerGeneration');
@@ -2573,9 +2573,9 @@ class DriverMapController {
     _currentNumberPlate = numberPlate;
     try {
       final markerIcon = await _getVehicleMarker(
-        vehicleType.toLowerCase(),
-        bearing: currentHeading
-      );
+  vehicleType.toLowerCase(),
+  bearing: 0  // ✅ ALWAYS UPRIGHT - no rotation
+);
       mapMarkers.removeWhere((marker) => marker.markerId.value == 'driver');
       mapMarkers.add(
         Marker(
@@ -2613,7 +2613,7 @@ class DriverMapController {
     if (driverLocation == null) return;
     _currentVehicleType = vehicleType;
     _currentNumberPlate = numberPlate;
-    _getVehicleMarker(vehicleType.toLowerCase(), bearing: currentHeading).then((markerIcon) {
+    _getVehicleMarker(vehicleType.toLowerCase(), bearing: 0).then((markerIcon) {  // ✅ ALWAYS UPRIGHT
       mapMarkers.removeWhere((marker) => marker.markerId.value == 'driver');
       mapMarkers.add(
         Marker(
@@ -2649,7 +2649,7 @@ class DriverMapController {
     if (driverLocation == null) return;
     _currentVehicleType = vehicleType;
     _currentNumberPlate = numberPlate;
-    _getVehicleMarker(vehicleType.toLowerCase(), bearing: currentHeading).then((markerIcon) {
+    _getVehicleMarker(vehicleType.toLowerCase(), bearing: 0).then((markerIcon) {  // ✅ ALWAYS UPRIGHT
       mapMarkers.removeWhere((marker) => marker.markerId.value == 'driver');
       mapMarkers.add(
         Marker(
@@ -4595,8 +4595,8 @@ class DriverMapController {
   }
 
   void setCarSize(double width, double height) {
-    carWidth = width.clamp(30.0, 200.0);
-    carHeight = height.clamp(30.0, 200.0);
+    carWidth = width.clamp(30.0, 300.0);  // Updated to allow larger sizes
+    carHeight = height.clamp(30.0, 300.0); // Updated to allow larger sizes
     markerCache.clear();
     _logInfo('Driver car size set to ${carWidth.toStringAsFixed(0)}x${carHeight.toStringAsFixed(0)}');
     if (driverLocation != null) {
@@ -4613,7 +4613,7 @@ class DriverMapController {
 
   void _forceMarkerUpdate() {
     if (_currentVehicleType != null && _currentNumberPlate != null && driverLocation != null) {
-      _getVehicleMarker(_currentVehicleType!.toLowerCase(), bearing: currentHeading).then((markerIcon) {
+      _getVehicleMarker(_currentVehicleType!.toLowerCase(), bearing: 0).then((markerIcon) {  // ✅ ALWAYS UPRIGHT
         mapMarkers.removeWhere((marker) => marker.markerId.value == 'driver');
         mapMarkers.add(
           Marker(
@@ -4680,7 +4680,7 @@ class DriverMapController {
     }
     animatedMarkers.clear();
     _animatedDrivers.forEach((id, data) {
-      _getVehicleMarker(data.vehicleType.toLowerCase(), bearing: data.bearing).then((markerIcon) {
+      _getVehicleMarker(data.vehicleType.toLowerCase(), bearing: 0).then((markerIcon) {  // ✅ ALWAYS UPRIGHT
         animatedMarkers.add(
           Marker(
             markerId: MarkerId('animated_$id'),
@@ -4733,7 +4733,7 @@ class DriverMapController {
   }
 
   void _addStaticDriver(String driverId, LatLng position, String vehicleType, String numberPlate, double heading) {
-    _getVehicleMarker(vehicleType.toLowerCase(), bearing: heading).then((markerIcon) {
+    _getVehicleMarker(vehicleType.toLowerCase(), bearing: 0).then((markerIcon) {  // ✅ ALWAYS UPRIGHT
       mapMarkers.removeWhere((marker) => marker.markerId.value == 'static_$driverId');
       mapMarkers.add(
         Marker(

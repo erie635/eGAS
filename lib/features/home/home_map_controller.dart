@@ -19,7 +19,7 @@ import 'dart:convert';
 import 'package:http/http.dart' as http;
 import 'package:flutter_tts/flutter_tts.dart';
 
-const String googleAPIKey = 'AIzaSyATIUosv_VCeiVsQ3q6_LSQhZkrHr0E79o';
+const String googleAPIKey = 'AIzaSyApq8kEfTzaC7Nb4PDYO1W-V3s-I9ZbMkI';
 
 // ============================================================
 // ENHANCED LANE INFO
@@ -94,7 +94,7 @@ class HomeMapController extends ChangeNotifier {
   // ============================================================
   // GOOGLE API KEY
   // ============================================================
-  static const String googleAPIKey = 'AIzaSyATIUosv_VCeiVsQ3q6_LSQhZkrHr0E79o';
+  static const String googleAPIKey = 'AIzaSyApq8kEfTzaC7Nb4PDYO1W-V3s-I9ZbMkI';
 
   // ============================================================
   // MAP CONTROLLER & STATE
@@ -280,8 +280,8 @@ class HomeMapController extends ChangeNotifier {
   // ============================================================
   // CAR SIZE - INCREASED FOR BETTER VISIBILITY
   // ============================================================
-  double carMarkerWidth = 120.0;
-  double carMarkerHeight = 160.0;
+  double carMarkerWidth = 220.0;
+  double carMarkerHeight = 100.0;
 
   // ============================================================
   // FUEL OPTIONS
@@ -2052,24 +2052,27 @@ class HomeMapController extends ChangeNotifier {
   }
 
   // ============================================================
-  // UPDATE DRIVER MARKER WITH ROTATION
+  // UPDATE DRIVER MARKER - CAR ROTATES TO FACE DIRECTION OF TRAVEL
   // ============================================================
-  void _updateDriverMarkerWithInterpolation() {
-    if (activeDriverId == null || activeDriverLocation == null || renderedPosition == null) return;
+  void _updateDriverMarkerWithBearing() {
+    if (activeDriverId == null || activeDriverLocation == null) return;
     
-    final lat = renderedPosition!.latitude;
-    final lng = renderedPosition!.longitude;
+    final pos = renderedPosition ?? LatLng(
+      activeDriverLocation!['lat'] ?? 0,
+      activeDriverLocation!['lng'] ?? 0,
+    );
     
     driverMarkers.removeWhere((marker) => marker.markerId.value == activeDriverId);
     
+    // ✅ Car image drawn UPRIGHT, rotation follows direction of travel
     final displayBearing = filteredBearing;
     
-    getVehicleMarker(activeDriverLocation!['vehicleType'] ?? 'medium', bearing: displayBearing).then((marker) {
+    getVehicleMarker(activeDriverLocation!['vehicleType'] ?? 'medium', bearing: 0).then((marker) {
       driverMarkers.add(Marker(
         markerId: MarkerId(activeDriverId!),
-        position: LatLng(lat, lng),
+        position: pos,
         icon: marker,
-        rotation: displayBearing,
+        rotation: displayBearing,  // ✅ Car rotates to face direction of travel
         anchor: const Offset(0.5, 0.5),
         flat: true,
         infoWindow: InfoWindow(
@@ -2081,24 +2084,23 @@ class HomeMapController extends ChangeNotifier {
     });
   }
 
-  void _updateDriverMarkerWithBearing() {
-    if (activeDriverId == null || activeDriverLocation == null) return;
+  void _updateDriverMarkerWithInterpolation() {
+    if (activeDriverId == null || activeDriverLocation == null || renderedPosition == null) return;
     
-    final pos = renderedPosition ?? LatLng(
-      activeDriverLocation!['lat'] ?? 0,
-      activeDriverLocation!['lng'] ?? 0,
-    );
+    final lat = renderedPosition!.latitude;
+    final lng = renderedPosition!.longitude;
     
     driverMarkers.removeWhere((marker) => marker.markerId.value == activeDriverId);
     
+    // ✅ Car image drawn UPRIGHT, rotation follows direction of travel
     final displayBearing = filteredBearing;
     
-    getVehicleMarker(activeDriverLocation!['vehicleType'] ?? 'medium', bearing: displayBearing).then((marker) {
+    getVehicleMarker(activeDriverLocation!['vehicleType'] ?? 'medium', bearing: 0).then((marker) {
       driverMarkers.add(Marker(
         markerId: MarkerId(activeDriverId!),
-        position: pos,
+        position: LatLng(lat, lng),
         icon: marker,
-        rotation: displayBearing,
+        rotation: displayBearing,  // ✅ Car rotates to face direction of travel
         anchor: const Offset(0.5, 0.5),
         flat: true,
         infoWindow: InfoWindow(

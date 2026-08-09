@@ -2,6 +2,7 @@
 // FILE: home_map_page.dart - WITH LARGER FONTS - CLEAN VERSION
 // INCLUDES V-POWER + 3 FUEL OPTIONS IN BOTTOM SHEET
 // CALL DRIVER BUTTON - CENTERED BOTTOM (ADJUSTED UP)
+// ✅ FIXED: Call Driver button only appears after driver accepts order
 // ============================================================
 
 import 'package:flutter/material.dart';
@@ -28,6 +29,13 @@ class _HomeMapPageState extends State<HomeMapPage> with WidgetsBindingObserver {
   Timer? _debounceTimer;
   Timer? _swipeThrottleTimer;
   double _throttledDragOffset = 0.0;
+  
+  // ✅ NEW: Track driver acceptance state
+  bool _isDriverAccepted = false;
+  String? _assignedDriverId;
+  String? _assignedDriverPhone;
+  String? _assignedDriverName;
+  StreamSubscription<DocumentSnapshot>? _orderSubscription;
 
   static const double _sheetHeight = 280.0;
   static const double _minDragLimit = 0.0;
@@ -40,6 +48,9 @@ class _HomeMapPageState extends State<HomeMapPage> with WidgetsBindingObserver {
     _controller = HomeMapController();
     _controller.setContext(context);
     _controller.addListener(_onControllerUpdate);
+    
+    // ✅ NEW: Start listening for driver acceptance if there's an active order
+    _startListeningForDriverAcceptance();
   }
 
   @override
@@ -53,6 +64,8 @@ class _HomeMapPageState extends State<HomeMapPage> with WidgetsBindingObserver {
     _debounceTimer = null;
     _swipeThrottleTimer?.cancel();
     _swipeThrottleTimer = null;
+    _orderSubscription?.cancel();
+    _orderSubscription = null;
     WidgetsBinding.instance.removeObserver(this);
     _controller.removeListener(_onControllerUpdate);
     
@@ -92,6 +105,90 @@ class _HomeMapPageState extends State<HomeMapPage> with WidgetsBindingObserver {
       case AppLifecycleState.hidden:
         break;
     }
+  }
+
+  // ✅ NEW: Listen for driver acceptance in real-time
+  void _startListeningForDriverAcceptance() {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) return;
+
+    // Get the user's active order
+    FirebaseFirestore.instance
+        .collection('orders')
+        .where('customerId', isEqualTo: user.uid)
+        .where('status', whereIn: ['pending', 'accepted', 'confirmed'])
+        .orderBy('createdAt', descending: true)
+        .limit(1)
+        .get()
+        .then((querySnapshot) {
+          if (querySnapshot.docs.isNotEmpty) {
+            final doc = querySnapshot.docs.first;
+            final orderId = doc.id;
+            
+            // Listen to this specific order
+            _orderSubscription?.cancel();
+            _orderSubscription = FirebaseFirestore.instance
+                .collection('orders')
+                .doc(orderId)
+                .snapshots()
+                .listen((snapshot) {
+                  if (!snapshot.exists) return;
+                  
+                  final data = snapshot.data()!;
+                  final String status = data['status'] ?? 'pending';
+                  final String? driverId = data['driverId'];
+                  final String? driverPhone = data['driverPhone'];
+                  final String? driverName = data['driverName'];
+                  
+                  // ✅ ONLY when status is 'accepted' and driverId exists
+                  if (status == 'accepted' && driverId != null && driverId.isNotEmpty) {
+                    _safeSetState(() {
+                      _isDriverAccepted = true;
+                      _assignedDriverId = driverId;
+                      _assignedDriverPhone = driverPhone;
+                      _assignedDriverName = driverName;
+                      _controller.driverPhoneNumber = driverPhone;
+                      _controller.isOrderAccepted = true;
+                      _controller.hasActiveOrder = true;
+                    });
+                    
+                    print('✅ Driver has accepted the order!');
+                    print('📞 Driver Phone: $driverPhone');
+                    print('👤 Driver Name: $driverName');
+                    
+                    // Show notification
+                    _showDriverAcceptedNotification(driverName);
+                  } 
+                  // ✅ Reset if order is cancelled or completed
+                  else if (status == 'cancelled' || status == 'completed' || status == 'delivered') {
+                    _safeSetState(() {
+                      _isDriverAccepted = false;
+                      _assignedDriverId = null;
+                      _assignedDriverPhone = null;
+                      _assignedDriverName = null;
+                      _controller.driverPhoneNumber = null;
+                    });
+                    _orderSubscription?.cancel();
+                    _orderSubscription = null;
+                  }
+                });
+          }
+        })
+        .catchError((e) {
+          print('Error listening for driver acceptance: $e');
+        });
+  }
+
+  void _showDriverAcceptedNotification(String? driverName) {
+    if (!mounted) return;
+    
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text('🚗 Driver ${driverName ?? ''} has accepted your order!'),
+        backgroundColor: Colors.green,
+        duration: const Duration(seconds: 3),
+      ),
+    );
   }
 
   @override
@@ -222,12 +319,12 @@ class _HomeMapPageState extends State<HomeMapPage> with WidgetsBindingObserver {
                 _buildUseAvailableFuelButton(),
 
               // ============================================================
-              // CALL DRIVER BUTTON - CENTERED BOTTOM (ADJUSTED UP)
+              // CALL DRIVER BUTTON - ONLY SHOWS AFTER DRIVER ACCEPTS ORDER ✅
               // ============================================================
-              if ((_controller.isOrderAccepted || _controller.hasActiveOrder) && 
-                  _controller.driverPhoneNumber != null && 
-                  _controller.driverPhoneNumber != 'N/A' &&
-                  _controller.driverPhoneNumber!.isNotEmpty)
+              if (_isDriverAccepted && // ✅ ONLY when driver has accepted
+                  _assignedDriverPhone != null && 
+                  _assignedDriverPhone!.isNotEmpty &&
+                  _assignedDriverPhone != 'N/A')
                 Positioned(
                   bottom: _controller.hasArrived ? 140 : 100,
                   left: 0,
@@ -237,10 +334,8 @@ class _HomeMapPageState extends State<HomeMapPage> with WidgetsBindingObserver {
                       key: const ValueKey('callDriverButton'),
                       onTap: () {
                         if (!_isDisposed && mounted) {
-                          final name = _controller.activeDriverLocation?['name'] ?? 
-                                      _controller.activeOrderDetails?['driverName'] ?? 
-                                      'Driver';
-                          final phone = _controller.driverPhoneNumber ?? 'N/A';
+                          final name = _assignedDriverName ?? 'Driver';
+                          final phone = _assignedDriverPhone ?? 'N/A';
                           _controller.callDriver(name, phone);
                         }
                       },

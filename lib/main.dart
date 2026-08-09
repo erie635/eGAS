@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_auth/firebase_auth.dart';
@@ -6,16 +8,33 @@ import 'firebase_options.dart';
 import 'features/home/home_map_page.dart';
 import 'features/driver/driver_login_page.dart';
 import 'features/auth/customer_login_page.dart';
-import 'features/customer/customer_dashboard.dart'; // ✅ KEEP ONLY ONE
+import 'features/customer/customer_dashboard.dart';
+import 'features/driver/driver_dashboard.dart';
 
-// ✅ REMOVED duplicate import of customer_dashboard.dart
-// ✅ REMOVED customer_profile_page.dart import (using customer_dashboard instead)
+// Global variable to track initialization
+bool _isFirebaseInitialized = false;
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await Firebase.initializeApp(
-    options: DefaultFirebaseOptions.currentPlatform,
-  );
+  
+  // ✅ Prevent duplicate initialization
+  if (!_isFirebaseInitialized) {
+    try {
+      await Firebase.initializeApp(
+        options: DefaultFirebaseOptions.currentPlatform,
+      );
+      _isFirebaseInitialized = true;
+    } catch (e) {
+      print('Firebase initialization error: $e');
+      if (e.toString().contains('duplicate-app')) {
+        print('Firebase already initialized, continuing...');
+        _isFirebaseInitialized = true;
+      } else {
+        rethrow;
+      }
+    }
+  }
+  
   runApp(const MyApp());
 }
 
@@ -25,7 +44,7 @@ class MyApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'E-Fuel Delivery',
+      title: 'eGAS',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         primaryColor: Colors.green,
@@ -37,13 +56,13 @@ class MyApp extends StatelessWidget {
           elevation: 0,
         ),
       ),
-      // ✅ NAMED ROUTES - Using CustomerDashboard consistently
       routes: {
         '/login': (context) => const CustomerLoginPage(),
         '/home': (context) => const HomeMapPage(),
-        '/profile': (context) => const CustomerDashboard(), // ✅ Using CustomerDashboard
+        '/profile': (context) => const CustomerDashboard(),
         '/driver_login': (context) => const DriverLoginPage(),
         '/customer_dashboard': (context) => const CustomerDashboard(),
+        '/driver_dashboard': (context) => const DriverDashboard(),
       },
       home: StreamBuilder<User?>(
         stream: FirebaseAuth.instance.authStateChanges(),
@@ -61,11 +80,200 @@ class MyApp extends StatelessWidget {
   }
 }
 
-class HomePage extends StatelessWidget {
+class HomePage extends StatefulWidget {
   const HomePage({super.key});
 
-  // ✅ Check if user is a driver by checking Firestore
-  Future<bool> _isDriver(User user) async {
+  @override
+  State<HomePage> createState() => _HomePageState();
+}
+
+class _HomePageState extends State<HomePage> {
+  Map<String, dynamic>? _userData;
+  bool _isDriver = false;
+  bool _isLoading = true;
+  String _displayName = 'User';
+  String _userEmail = 'No email';
+  
+  // Stream subscriptions for real-time updates
+  StreamSubscription<DocumentSnapshot>? _driverSubscription;
+  StreamSubscription<DocumentSnapshot>? _customerSubscription;
+  StreamSubscription<User?>? _authSubscription;
+
+  @override
+  void initState() {
+    super.initState();
+    _setupAuthListener();
+    _loadUserData();
+    _listenToUserData();
+  }
+
+  @override
+  void dispose() {
+    _driverSubscription?.cancel();
+    _customerSubscription?.cancel();
+    _authSubscription?.cancel();
+    super.dispose();
+  }
+
+  // Listen to auth state changes
+  void _setupAuthListener() {
+    _authSubscription = FirebaseAuth.instance.authStateChanges().listen((user) {
+      if (user != null) {
+        // User logged in, load data
+        _loadUserData();
+        _listenToUserData();
+      } else {
+        // User logged out, reset state
+        setState(() {
+          _isDriver = false;
+          _userData = null;
+          _displayName = 'User';
+          _userEmail = 'No email';
+          _isLoading = false;
+        });
+      }
+    });
+  }
+
+  // Real-time listener for user data
+  void _listenToUserData() {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) return;
+
+    // Cancel existing subscriptions
+    _driverSubscription?.cancel();
+    _customerSubscription?.cancel();
+
+    // Listen to driver collection
+    _driverSubscription = FirebaseFirestore.instance
+        .collection('drivers')
+        .doc(user.uid)
+        .snapshots()
+        .listen((snapshot) {
+      if (snapshot.exists && mounted) {
+        setState(() {
+          _isDriver = true;
+          _userData = snapshot.data();
+          _updateDisplayInfo(snapshot.data()!);
+          _isLoading = false;
+        });
+      } else {
+        // If driver doesn't exist, check customer
+        _checkCustomerData(user.uid);
+      }
+    }, onError: (error) {
+      print('Error listening to driver data: $error');
+    });
+
+    // Also listen to customer collection as fallback
+    _customerSubscription = FirebaseFirestore.instance
+        .collection('customers')
+        .doc(user.uid)
+        .snapshots()
+        .listen((snapshot) {
+      if (snapshot.exists && mounted && !_isDriver) {
+        setState(() {
+          _userData = snapshot.data();
+          _updateDisplayInfo(snapshot.data()!);
+          _isLoading = false;
+        });
+      }
+    }, onError: (error) {
+      print('Error listening to customer data: $error');
+    });
+  }
+
+  void _checkCustomerData(String uid) {
+    // This is called when driver doesn't exist
+    // The customer stream will handle the update
+  }
+
+  void _updateDisplayInfo(Map<String, dynamic> data) {
+    final user = FirebaseAuth.instance.currentUser;
+    String displayName = user?.displayName ?? 'User';
+    String userEmail = user?.email ?? 'No email';
+    
+    if (data['firstName'] != null && data['lastName'] != null) {
+      displayName = '${data['firstName']} ${data['lastName']}';
+    } else if (data['fullName'] != null) {
+      displayName = data['fullName'];
+    } else if (data['name'] != null) {
+      displayName = data['name'];
+    }
+    if (data['email'] != null) {
+      userEmail = data['email'];
+    }
+    
+    _displayName = displayName;
+    _userEmail = userEmail;
+  }
+
+  Future<void> _loadUserData() async {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user != null) {
+      try {
+        final driverDoc = await FirebaseFirestore.instance
+            .collection('drivers')
+            .doc(user.uid)
+            .get();
+        
+        final isDriverNow = driverDoc.exists;
+        
+        final customerDoc = await FirebaseFirestore.instance
+            .collection('customers')
+            .doc(user.uid)
+            .get();
+        
+        Map<String, dynamic>? userData;
+        if (isDriverNow) {
+          userData = driverDoc.data();
+        } else if (customerDoc.exists) {
+          userData = customerDoc.data();
+        }
+        
+        String displayName = user.displayName ?? 'User';
+        String userEmail = user.email ?? 'No email';
+        
+        if (userData != null) {
+          if (userData['firstName'] != null && userData['lastName'] != null) {
+            displayName = '${userData['firstName']} ${userData['lastName']}';
+          } else if (userData['fullName'] != null) {
+            displayName = userData['fullName'];
+          } else if (userData['name'] != null) {
+            displayName = userData['name'];
+          }
+          if (userData['email'] != null) {
+            userEmail = userData['email'];
+          }
+        }
+        
+        if (mounted) {
+          setState(() {
+            _isDriver = isDriverNow;
+            _userData = userData;
+            _displayName = displayName;
+            _userEmail = userEmail;
+            _isLoading = false;
+          });
+        }
+      } catch (e) {
+        print('Error loading user data: $e');
+        if (mounted) {
+          setState(() {
+            _isLoading = false;
+          });
+        }
+      }
+    } else {
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+        });
+      }
+    }
+  }
+
+  Future<bool> _isDriverCheck(User user) async {
     try {
       final driverDoc = await FirebaseFirestore.instance
           .collection('drivers')
@@ -84,80 +292,412 @@ class HomePage extends StatelessWidget {
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('⛽ E-Fuel Delivery'),
+        title: const Text('⛽ eGAS'),
         backgroundColor: Colors.green,
         foregroundColor: Colors.white,
         actions: [
-          if (user != null)
-            PopupMenuButton<String>(
-              icon: const Icon(Icons.account_circle),
-              onSelected: (value) {
-                if (value == 'profile') {
-                  // ✅ NAVIGATE TO CUSTOMER DASHBOARD
-                  Navigator.push(
-                    context,
-                    MaterialPageRoute(
-                      builder: (_) => const CustomerDashboard(),
+          // Use a Builder to ensure the menu rebuilds with latest state
+          Builder(
+            builder: (context) {
+              return PopupMenuButton<String>(
+                icon: const Icon(Icons.account_circle),
+                onSelected: (value) {
+                  if (user == null) {
+                    if (value == 'account' || value == 'profile') {
+                      _showNoUserMessage(context, 'No profile to display. Please login first.');
+                    } else if (value == 'change_password') {
+                      _showNoUserMessage(context, 'No account to change password. Please login first.');
+                    } else if (value == 'delete_account') {
+                      _showNoUserMessage(context, 'No account to delete. Please login first.');
+                    } else if (value == 'logout') {
+                      _showNoUserMessage(context, 'No user logged in to sign out.');
+                    } else if (value == 'refresh') {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(
+                          content: Text('Refreshing app state...'),
+                          backgroundColor: Colors.blue,
+                        ),
+                      );
+                      _loadUserData();
+                    } else if (value == 'driver_login') {
+                      Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                          builder: (_) => const DriverLoginPage(),
+                        ),
+                      );
+                    }
+                    return;
+                  }
+
+                  if (value == 'account' || value == 'profile') {
+                    if (!_isDriver) {
+                      Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                          builder: (_) => const CustomerDashboard(),
+                        ),
+                      );
+                    } else {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(
+                          content: Text('Drivers do not have a customer profile.'),
+                          backgroundColor: Colors.orange,
+                        ),
+                      );
+                    }
+                  } else if (value == 'refresh') {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(
+                        content: Text('Refreshing profile data...'),
+                        backgroundColor: Colors.green,
+                      ),
+                    );
+                    _loadUserData();
+                  } else if (value == 'change_password') {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(
+                        content: Text('Change password functionality coming soon...'),
+                        backgroundColor: Colors.orange,
+                      ),
+                    );
+                  } else if (value == 'delete_account') {
+                    _showDeleteAccountDialog(context);
+                  } else if (value == 'logout') {
+                    FirebaseAuth.instance.signOut();
+                  } else if (value == 'driver_login') {
+                    // If user is already a driver, navigate to driver dashboard
+                    if (_isDriver) {
+                      // Show message and navigate to driver dashboard
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(
+                          content: Text('You are already logged in as a driver.'),
+                          backgroundColor: Colors.green,
+                          duration: Duration(seconds: 1),
+                        ),
+                      );
+                      // Navigate to driver dashboard
+                      Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                          builder: (_) => const DriverDashboard(),
+                        ),
+                      );
+                    } else {
+                      // If not a driver, navigate to driver login page
+                      Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                          builder: (_) => const DriverLoginPage(),
+                        ),
+                      );
+                    }
+                  }
+                },
+                itemBuilder: (context) {
+                  List<PopupMenuEntry<String>> menuItems = [];
+                  final isLoggedIn = user != null;
+
+                  // 1. Account Info Section (Header)
+                  if (isLoggedIn) {
+                    menuItems.add(
+                      PopupMenuItem<String>(
+                        value: 'header',
+                        enabled: false,
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(
+                              children: [
+                                const Icon(Icons.account_circle, color: Colors.green, size: 28),
+                                const SizedBox(width: 8),
+                                Text(
+                                  _displayName,
+                                  style: const TextStyle(
+                                    fontWeight: FontWeight.bold,
+                                    fontSize: 16,
+                                  ),
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 4),
+                            Text(
+                              _userEmail,
+                              style: const TextStyle(
+                                fontSize: 14,
+                                color: Colors.grey,
+                              ),
+                            ),
+                            const SizedBox(height: 2),
+                            Text(
+                              'Account created: ${user!.metadata.creationTime != null ? _formatDate(user.metadata.creationTime!) : 'N/A'}',
+                              style: const TextStyle(
+                                fontSize: 11,
+                                color: Colors.grey,
+                              ),
+                            ),
+                            const SizedBox(height: 4),
+                            Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                              decoration: BoxDecoration(
+                                color: _isDriver ? Colors.green.shade100 : Colors.blue.shade100,
+                                borderRadius: BorderRadius.circular(4),
+                              ),
+                              child: Text(
+                                _isDriver ? 'Driver' : 'Customer',
+                                style: TextStyle(
+                                  fontSize: 10,
+                                  fontWeight: FontWeight.w600,
+                                  color: _isDriver ? Colors.green.shade800 : Colors.blue.shade800,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    );
+                  } else {
+                    menuItems.add(
+                      const PopupMenuItem<String>(
+                        value: 'header',
+                        enabled: false,
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(
+                              children: [
+                                Icon(Icons.account_circle, color: Colors.grey, size: 28),
+                                SizedBox(width: 8),
+                                Text(
+                                  'Not Logged In',
+                                  style: TextStyle(
+                                    fontWeight: FontWeight.bold,
+                                    fontSize: 16,
+                                    color: Colors.grey,
+                                  ),
+                                ),
+                              ],
+                            ),
+                            SizedBox(height: 4),
+                            Text(
+                              'Please login to access your account',
+                              style: TextStyle(
+                                fontSize: 12,
+                                color: Colors.grey,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    );
+                  }
+
+                  menuItems.add(const PopupMenuDivider());
+
+                  // 2. Account Settings Section
+                  menuItems.add(
+                    const PopupMenuItem<String>(
+                      value: 'settings_header',
+                      enabled: false,
+                      child: Text(
+                        'Account Settings',
+                        style: TextStyle(
+                          fontWeight: FontWeight.bold,
+                          fontSize: 14,
+                          color: Colors.grey,
+                        ),
+                      ),
                     ),
                   );
-                } else if (value == 'dashboard') {
-                  Navigator.push(
-                    context,
-                    MaterialPageRoute(
-                      builder: (_) => const CustomerDashboard(),
+
+                  // My Profile - DISABLED for drivers (greyed out with lock)
+                  final isDriverUser = isLoggedIn && _isDriver;
+                  final isCustomerUser = isLoggedIn && !_isDriver;
+                  
+                  menuItems.add(
+                    PopupMenuItem<String>(
+                      value: 'profile',
+                      enabled: isCustomerUser,
+                      child: Row(
+                        children: [
+                          Icon(
+                            Icons.person,
+                            color: isCustomerUser ? Colors.green : Colors.grey.shade400,
+                          ),
+                          const SizedBox(width: 12),
+                          Text(
+                            'My Profile',
+                            style: TextStyle(
+                              color: isCustomerUser ? null : Colors.grey.shade400,
+                            ),
+                          ),
+                          if (isDriverUser) ...[
+                            const Spacer(),
+                            Icon(
+                              Icons.lock,
+                              color: Colors.grey.shade400,
+                              size: 16,
+                            ),
+                          ],
+                          if (!isLoggedIn) ...[
+                            const Spacer(),
+                            Icon(
+                              Icons.lock,
+                              color: Colors.grey.shade400,
+                              size: 16,
+                            ),
+                          ],
+                        ],
+                      ),
                     ),
                   );
-                } else if (value == 'logout') {
-                  FirebaseAuth.instance.signOut();
-                }
-              },
-              itemBuilder: (context) => [
-                const PopupMenuItem(
-                  value: 'profile',
-                  child: Row(
-                    children: [
-                      Icon(Icons.person),
-                      SizedBox(width: 8),
-                      Text('My Profile'),
-                    ],
-                  ),
-                ),
-                const PopupMenuItem(
-                  value: 'dashboard',
-                  child: Row(
-                    children: [
-                      Icon(Icons.dashboard),
-                      SizedBox(width: 8),
-                      Text('Dashboard'),
-                    ],
-                  ),
-                ),
-                const PopupMenuItem(
-                  value: 'logout',
-                  child: Row(
-                    children: [
-                      Icon(Icons.logout),
-                      SizedBox(width: 8),
-                      Text('Logout'),
-                    ],
-                  ),
-                ),
-              ],
-            ),
+
+                  menuItems.add(
+                    const PopupMenuItem<String>(
+                      value: 'refresh',
+                      child: Row(
+                        children: [
+                          Icon(Icons.refresh, color: Colors.blue),
+                          SizedBox(width: 12),
+                          Text('Refresh Profile Data'),
+                        ],
+                      ),
+                    ),
+                  );
+
+                  menuItems.add(
+                    PopupMenuItem<String>(
+                      value: 'change_password',
+                      enabled: true,
+                      child: Row(
+                        children: [
+                          Icon(
+                            Icons.lock_outline,
+                            color: isLoggedIn ? Colors.orange : Colors.grey.shade600,
+                          ),
+                          const SizedBox(width: 12),
+                          Text(
+                            'Change Password',
+                            style: TextStyle(
+                              color: isLoggedIn ? null : Colors.grey.shade600,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  );
+
+                  menuItems.add(
+                    PopupMenuItem<String>(
+                      value: 'delete_account',
+                      enabled: true,
+                      child: Row(
+                        children: [
+                          Icon(
+                            Icons.delete_outline,
+                            color: isLoggedIn ? Colors.red : Colors.grey.shade600,
+                          ),
+                          const SizedBox(width: 12),
+                          Text(
+                            'Delete Account',
+                            style: TextStyle(
+                              color: isLoggedIn ? null : Colors.grey.shade600,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  );
+
+                  menuItems.add(const PopupMenuDivider());
+
+                  // 3. Driver Section - ENABLED for drivers and when no user is logged in
+                  // DISABLED for customers only
+                  final isDriverUser2 = isLoggedIn && _isDriver;
+                  final isCustomerUser2 = isLoggedIn && !_isDriver;
+                  final isNotLoggedIn = !isLoggedIn;
+                  
+                  menuItems.add(
+                    PopupMenuItem<String>(
+                      value: 'driver_login',
+                      enabled: isDriverUser2 || isNotLoggedIn, // Enabled for drivers AND when no user
+                      child: Row(
+                        children: [
+                          Icon(
+                            Icons.directions_car,
+                            color: (isDriverUser2 || isNotLoggedIn) ? Colors.orange : Colors.grey.shade400,
+                          ),
+                          const SizedBox(width: 12),
+                          Text(
+                            isDriverUser2 ? 'Already a Driver' : 'Login as a Driver',
+                            style: TextStyle(
+                              color: (isDriverUser2 || isNotLoggedIn) ? null : Colors.grey.shade400,
+                              fontWeight: (isDriverUser2 || isNotLoggedIn) ? FontWeight.normal : FontWeight.normal,
+                            ),
+                          ),
+                          if (isDriverUser2) ...[
+                            const Spacer(),
+                            Icon(
+                              Icons.check_circle,
+                              color: Colors.green,
+                              size: 16,
+                            ),
+                          ],
+                          if (isCustomerUser2) ...[
+                            const Spacer(),
+                            Icon(
+                              Icons.lock,
+                              color: Colors.grey.shade400,
+                              size: 16,
+                            ),
+                          ],
+                        ],
+                      ),
+                    ),
+                  );
+
+                  menuItems.add(const PopupMenuDivider());
+
+                  // 4. Logout Section
+                  menuItems.add(
+                    PopupMenuItem<String>(
+                      value: 'logout',
+                      enabled: true,
+                      child: Row(
+                        children: [
+                          Icon(
+                            Icons.logout,
+                            color: isLoggedIn ? Colors.red : Colors.grey.shade600,
+                          ),
+                          const SizedBox(width: 12),
+                          Text(
+                            'Sign Out',
+                            style: TextStyle(
+                              color: isLoggedIn ? null : Colors.grey.shade600,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  );
+
+                  return menuItems;
+                },
+              );
+            },
+          ),
         ],
       ),
       body: FutureBuilder<bool>(
-        future: user != null ? _isDriver(user) : Future.value(false),
+        future: user != null ? _isDriverCheck(user) : Future.value(false),
         builder: (context, snapshot) {
-          // Handle loading state
-          if (snapshot.connectionState == ConnectionState.waiting) {
+          if (snapshot.connectionState == ConnectionState.waiting && _isLoading) {
             return const Center(
               child: CircularProgressIndicator(),
             );
           }
 
-          final isDriver = snapshot.data ?? false;
-          final isCustomer = user != null && !isDriver;
+          final isDriver = _isDriver || (snapshot.data ?? false);
 
           return Container(
             width: double.infinity,
@@ -188,7 +728,6 @@ class HomePage extends StatelessWidget {
                 ),
                 const SizedBox(height: 40),
 
-                // 👤 CUSTOMER MODE
                 SizedBox(
                   width: double.infinity,
                   child: ElevatedButton.icon(
@@ -240,40 +779,6 @@ class HomePage extends StatelessWidget {
 
                 const SizedBox(height: 16),
 
-                //  DRIVER MODE - Simple clickable word
-                GestureDetector(
-                  onTap: isCustomer
-                      ? null
-                      : () {
-                          Navigator.push(
-                            context,
-                            MaterialPageRoute(
-                              builder: (_) => const DriverLoginPage(),
-                            ),
-                          );
-                        },
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(vertical: 8.0),
-                    child: Text(
-                      isCustomer
-                          ? 'Driver Mode Unavailable'
-                          : user != null && isDriver
-                              ? ' Driver Mode Active'
-                              : 'Driver Mode',
-                      style: TextStyle(
-                        fontSize: 16,
-                        fontWeight: FontWeight.w600,
-                        color: isCustomer
-                            ? Colors.grey.shade400
-                            : user != null && isDriver
-                                ? Colors.green
-                                : Colors.orange,
-                      ),
-                    ),
-                  ),
-                ),
-
-                // ✅ PROFILE BUTTON AT BOTTOM - Only for customers
                 if (user != null && !isDriver) ...[
                   const SizedBox(height: 30),
                   const Divider(),
@@ -304,13 +809,12 @@ class HomePage extends StatelessWidget {
                   ),
                 ],
 
-                // ✅ DRIVER STATUS - Show when driver is logged in
                 if (user != null && isDriver) ...[
                   const SizedBox(height: 30),
                   const Divider(),
                   const SizedBox(height: 10),
                   Text(
-                    'You are logged in as: ${user.email}',
+                    'You are logged in as: $_displayName',
                     style: TextStyle(
                       fontSize: 12,
                       color: Colors.grey.shade600,
@@ -340,5 +844,54 @@ class HomePage extends StatelessWidget {
         },
       ),
     );
+  }
+
+  void _showNoUserMessage(BuildContext context, String message) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        backgroundColor: Colors.orange,
+        duration: const Duration(seconds: 2),
+      ),
+    );
+  }
+
+  void _showDeleteAccountDialog(BuildContext context) {
+    showDialog(
+      context: context,
+      builder: (BuildContext context) {
+        return AlertDialog(
+          title: const Text('Delete Account'),
+          content: const Text(
+            'Are you sure you want to permanently delete your account? This action cannot be undone.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Cancel'),
+            ),
+            TextButton(
+              onPressed: () {
+                Navigator.pop(context);
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(
+                    content: Text('Account deletion functionality coming soon...'),
+                    backgroundColor: Colors.red,
+                  ),
+                );
+              },
+              style: TextButton.styleFrom(
+                foregroundColor: Colors.red,
+              ),
+              child: const Text('Delete'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  String _formatDate(DateTime date) {
+    return '${date.day}/${date.month}/${date.year}';
   }
 }
